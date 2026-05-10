@@ -114,6 +114,29 @@ class PipeResult:
     solver_options: dict
     elapsed_seconds: float
 
+    # Two-phase diagnostics (Phase: backlog item 1).
+    #
+    # T_dew[i] is the dew-point temperature at station i's pressure, or
+    # NaN if CoolProp could not compute it (e.g. above the cricondenbar
+    # or numerical failure). T_margin[i] = T[i] - T_dew[i].
+    #
+    # metastable_mask[i] is True iff T[i] < T_dew[i] — i.e. the station
+    # lies inside the two-phase dome and the solver continued via gas-
+    # phase metastable extrapolation.
+    #
+    # had_metastable summarises the mask; x_dewpoint_crossing is the
+    # axial position of the FIRST station where the mask becomes True
+    # (None if never crossed). LVF (liquid volume fraction) is filled in
+    # post-march for metastable stations only — NaN elsewhere.
+    T_dew: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    T_margin: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    metastable_mask: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=bool)
+    )
+    had_metastable: bool = False
+    x_dewpoint_crossing: float | None = None
+    LVF: np.ndarray = field(default_factory=lambda: np.zeros(0))
+
     def summary(self) -> str:
         """Return a formatted multi-line summary string (~70-80 chars wide).
 
@@ -240,6 +263,100 @@ class PipeResult:
         lines.append(f"  μ_JT range:       {muJT_min:.1f} → {muJT_max:.1f} K/bar")
         lines.append(f"  ΔT total:        {dT_total:.1f} K")
         lines.append("")
+
+        # TWO-PHASE diagnostics — emitted only when the march entered the
+        # two-phase dome at one or more stations. The section is intentionally
+        # qualitative: the LVF estimate comes from a bracket-search on the
+        # saturation curve, which is fine for severity classification but is
+        # not a substitute for a true two-phase solver (OLGA, HEM, etc.).
+        if self.had_metastable:
+            meta_idx = np.flatnonzero(self.metastable_mask)
+            finite_margin_in_meta = np.isfinite(self.T_margin[meta_idx])
+            L_pipe = float(self.x[-1]) - float(self.x[0])
+
+            if meta_idx.size == 0 or not np.any(finite_margin_in_meta):
+                # Defensive: had_metastable True but nothing usable to report.
+                # Should not occur because metastable_mask requires finite
+                # T_dew (so T_margin is finite there too) — but if a future
+                # refactor changes that, surface a clear one-line note rather
+                # than silently emitting a malformed section.
+                lines.append("TWO-PHASE")
+                lines.append(
+                    "  Dew curve crossed but T_margin could not be"
+                    " characterised."
+                )
+                lines.append(
+                    "  Treat results as approximate single-phase"
+                    " extrapolation."
+                )
+                lines.append("")
+            else:
+                first_idx = int(meta_idx[0])
+                last_idx = int(meta_idx[-1])
+                x_first = float(self.x[first_idx])
+                x_last = float(self.x[last_idx])
+                region_len = x_last - x_first
+                pct_cross = 100.0 * x_first / L_pipe if L_pipe > 0 else 0.0
+                pct_region = 100.0 * region_len / L_pipe if L_pipe > 0 else 0.0
+
+                margin_idx = meta_idx[finite_margin_in_meta]
+                min_margin_pos = int(
+                    margin_idx[np.argmin(self.T_margin[margin_idx])]
+                )
+                min_margin_val = float(self.T_margin[min_margin_pos])
+                x_min_margin = float(self.x[min_margin_pos])
+
+                meta_lvf = self.LVF[meta_idx]
+                finite_meta_lvf = meta_lvf[np.isfinite(meta_lvf)]
+
+                lines.append("TWO-PHASE")
+                lines.append(
+                    f"  Dew point crossed at:   x = {x_first:.2f} m"
+                    f"  ({pct_cross:.1f}% of pipe length)"
+                )
+                lines.append(
+                    f"  Min T_margin:           {min_margin_val:.1f} K"
+                    f" at x = {x_min_margin:.2f} m"
+                )
+                lines.append(
+                    f"  Metastable region:      x = {x_first:.2f} m to"
+                    f" {x_last:.2f} m ({region_len:.1f} m,"
+                    f" {pct_region:.1f}% of pipe)"
+                )
+
+                if finite_meta_lvf.size == 0:
+                    lines.append(
+                        "  Max LVF:                — (flash failed at every"
+                        " metastable station)"
+                    )
+                    lines.append(
+                        "  Severity:               LVF could not be"
+                        " computed (flash failures)."
+                    )
+                    lines.append(
+                        "                          Treat results as"
+                        " approximate single-phase extrapolation."
+                    )
+                else:
+                    lvf_max = float(np.max(finite_meta_lvf))
+                    lines.append(
+                        f"  Max LVF:                {lvf_max:.3f}"
+                        f" ({lvf_max * 100:.1f}%)"
+                    )
+                    if lvf_max < 0.01:
+                        lines.append("  Severity:               Marginal condensation.")
+                        lines.append("                          Single-phase model accuracy comparable")
+                        lines.append("                          to FSA at low LVF.")
+                    elif lvf_max < 0.05:
+                        lines.append("  Severity:               Light condensation.")
+                        lines.append("                          Single-phase ΔP may under-predict by 5-15%.")
+                        lines.append("                          Consider HEM cross-check for safety-critical")
+                        lines.append("                          sizing.")
+                    else:
+                        lines.append("  Severity:               Significant condensation.")
+                        lines.append("                          Single-phase model not appropriate.")
+                        lines.append("                          Use OLGA two-phase or HEM.")
+                lines.append("")
 
         lines.append("NUMERICAL")
         lines.append(f"  Segments:         {n_segs} ({n_adaptive} adaptive refinements near choke)")

@@ -73,9 +73,23 @@ def plot_profile(
     ax.set_title("Pressure")
     ax.grid(True, alpha=0.3)
 
-    # (0,1) Temperature
+    # (0,1) Temperature — overlay the dew-point curve where finite so the
+    # viewer can see at a glance whether the gas T crosses below T_dew.
     ax = axes[0, 1]
-    ax.plot(x, result.T - 273.15, "r-", lw=1.5)
+    ax.plot(x, result.T - 273.15, "r-", lw=1.5, label="T (gas)")
+    has_T_dew = (
+        getattr(result, "T_dew", None) is not None
+        and len(result.T_dew) == len(x)
+        and bool(np.any(np.isfinite(result.T_dew)))
+    )
+    if has_T_dew:
+        T_dew_C = result.T_dew - 273.15
+        finite = np.isfinite(T_dew_C)
+        ax.plot(
+            x[finite], T_dew_C[finite],
+            color="orange", linestyle="--", lw=1.5, label="T_dew",
+        )
+        ax.legend(loc="best", fontsize=8)
     _vchoke(ax)
     ax.set_xlabel("x [m]")
     ax.set_ylabel("T [°C]")
@@ -115,6 +129,26 @@ def plot_profile(
     ax.fill_between(x, 0, 1, where=M >= 0.9, color="red", alpha=0.15)
     ax.plot(x, M, "k-", lw=1.8, label="Mach")
     ax.axhline(1.0, color="red", lw=1.2, ls="-", alpha=0.7)
+    # Metastable shading: highlight where T < T_dew so the viewer can see
+    # which part of the curve is operating outside strict single-phase
+    # domain. Multiple contiguous runs are shaded but only the first run
+    # gets a legend entry to avoid duplicate "Metastable" tokens.
+    if getattr(result, "had_metastable", False):
+        in_meta = np.asarray(result.metastable_mask, dtype=bool)
+        diffs = np.diff(in_meta.astype(np.int8))
+        starts = np.where(diffs == 1)[0] + 1
+        ends = np.where(diffs == -1)[0] + 1
+        if in_meta.size > 0 and in_meta[0]:
+            starts = np.insert(starts, 0, 0)
+        if in_meta.size > 0 and in_meta[-1]:
+            ends = np.append(ends, in_meta.size)
+        last_x = len(x) - 1
+        for j, (s, e) in enumerate(zip(starts, ends)):
+            label = "Metastable" if j == 0 else None
+            ax.axvspan(
+                float(x[s]), float(x[min(e, last_x)]),
+                alpha=0.15, color="gold", label=label,
+            )
     _vchoke(ax)
     ax.set_xlabel("x [m]")
     ax.set_ylabel("Mach [-]")
@@ -133,9 +167,23 @@ def plot_profile(
     ax.set_title("Friction Factor")
     ax.grid(True, alpha=0.3)
 
+    # Suptitle: build from independent CHOKED / TWO-PHASE flags so both
+    # show when applicable. Falls back to the subsonic single-phase label
+    # only when neither condition fired.
+    title_parts: list[str] = []
+    title_color = "black"
     if choked and x_choke is not None:
         pct = x_choke / L * 100 if L > 0 else 0.0
-        fig.suptitle(f"CHOKED at x = {x_choke:.2f} m ({pct:.1f}% of pipe length)", fontsize=11, color="red")
+        title_parts.append(
+            f"CHOKED at x = {x_choke:.2f} m ({pct:.1f}% of pipe length)"
+        )
+        title_color = "red"
+    if getattr(result, "had_metastable", False) and result.x_dewpoint_crossing is not None:
+        title_parts.append(
+            f"TWO-PHASE region from x = {result.x_dewpoint_crossing:.2f} m"
+        )
+    if title_parts:
+        fig.suptitle(" — ".join(title_parts), fontsize=11, color=title_color)
     else:
         fig.suptitle("Flow Profile — Subsonic", fontsize=11)
 

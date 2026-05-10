@@ -576,6 +576,24 @@ class MainWindow:
         self._summary_text = tk.Text(
             text_frame, wrap="none", font=("Consolas", 10), state="disabled"
         )
+        # Banner tag styles for the two-phase warning. Three severity
+        # bands map to escalating yellow→orange→red palettes; the actual
+        # band is picked by _classify_severity based on max LVF.
+        self._summary_text.tag_configure(
+            "banner_marginal",
+            background="#fff7e0", foreground="#7a5b00",
+            font=("Consolas", 10, "bold"),
+        )
+        self._summary_text.tag_configure(
+            "banner_light",
+            background="#ffe4b5", foreground="#7a4500",
+            font=("Consolas", 10, "bold"),
+        )
+        self._summary_text.tag_configure(
+            "banner_significant",
+            background="#ffcccc", foreground="#8b0000",
+            font=("Consolas", 10, "bold"),
+        )
         sb_y = ttk.Scrollbar(text_frame, orient="vertical", command=self._summary_text.yview)
         sb_x = ttk.Scrollbar(text_frame, orient="horizontal", command=self._summary_text.xview)
         self._summary_text.configure(yscrollcommand=sb_y.set, xscrollcommand=sb_x.set)
@@ -1247,12 +1265,47 @@ class MainWindow:
         self._populate_table_tab(result)
         # Plateau Sweep tab is populated separately by the sweep button.
 
+    @staticmethod
+    def _classify_severity(result: "PipeResult") -> tuple[str | None, str | None]:
+        """Severity band + banner tag name for a result's max LVF.
+
+        Returns (None, None) when the result did not enter the two-phase
+        dome. When metastable but every LVF station is NaN (flash failed
+        everywhere), maps to the marginal band so the user still sees
+        a warning. Thresholds match the summary() bands so the banner
+        and the TWO-PHASE section never disagree.
+        """
+        import numpy as _np
+        if not getattr(result, "had_metastable", False):
+            return None, None
+        LVF = getattr(result, "LVF", None)
+        if LVF is None or len(LVF) == 0 or bool(_np.all(_np.isnan(LVF))):
+            return "LVF UNKNOWN — flash failures", "banner_marginal"
+        lvf_max = float(_np.nanmax(LVF))
+        if lvf_max < 0.01:
+            return "Marginal condensation", "banner_marginal"
+        if lvf_max < 0.05:
+            return "Light condensation", "banner_light"
+        return "Significant condensation", "banner_significant"
+
     def _populate_summary_tab(self, result: "PipeResult") -> None:
         text = result.summary()
         self._summary_text.configure(state="normal")
         self._summary_text.delete("1.0", "end")
-        self._summary_text.insert("1.0", text)
+        if getattr(result, "had_metastable", False):
+            severity, banner_tag = self._classify_severity(result)
+            if severity is not None and banner_tag is not None:
+                banner = (
+                    "=" * 80 + "\n"
+                    f"⚠ TWO-PHASE WARNING — {severity}\n"
+                    + "=" * 80 + "\n\n"
+                )
+                self._summary_text.insert("end", banner, banner_tag)
+        self._summary_text.insert("end", text)
         self._summary_text.configure(state="disabled")
+        # Scroll back to the top so the banner is in view, not the bottom
+        # of the summary where the previous content was anchored.
+        self._summary_text.see("1.0")
 
     def _populate_profile_tab(self, result: "PipeResult") -> None:
         if self._figure is None or self._figure_canvas is None:

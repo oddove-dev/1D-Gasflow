@@ -115,6 +115,36 @@ def _build_result(
     opts_full = dict(opts)
     opts_full["n_adaptive_refinements"] = n_adaptive
 
+    # Two-phase diagnostics: at each station compute the dew-point
+    # temperature; flag stations where T < T_dew as metastable. The
+    # GERGFluid.dew_temperature is cached per-pressure so repeat calls
+    # at the same P (common when Newton revisits a state) are free.
+    T_dew_arr = np.full(n, np.nan, dtype=float)
+    for i, P_i in enumerate(P_arr):
+        td = fluid.dew_temperature(float(P_i))
+        if td is not None:
+            T_dew_arr[i] = td
+    T_margin_arr = T_arr - T_dew_arr  # NaN propagates where T_dew unknown
+    # metastable_mask: True only where we have a finite T_dew AND T < T_dew.
+    # NaN comparisons are False, which is the desired behaviour here.
+    with np.errstate(invalid="ignore"):
+        metastable_mask = np.asarray(T_arr < T_dew_arr, dtype=bool)
+    had_metastable = bool(np.any(metastable_mask))
+    x_dewpoint_crossing: float | None = None
+    if had_metastable:
+        first = int(np.argmax(metastable_mask))
+        x_dewpoint_crossing = float(x_arr[first])
+    # LVF (liquid volume fraction) — populated only at metastable stations
+    # via isenthalpic flash. Non-metastable stations stay NaN, which the
+    # summary and plot treat as "not applicable, gas single-phase".
+    LVF_arr = np.full(n, np.nan, dtype=float)
+    if had_metastable:
+        meta_indices = np.flatnonzero(metastable_mask)
+        for i in meta_indices:
+            LVF_arr[int(i)] = fluid.compute_lvf(
+                float(P_arr[int(i)]), float(h_arr[int(i)])
+            )
+
     return PipeResult(
         x=x_arr,
         P=P_arr,
@@ -144,6 +174,12 @@ def _build_result(
         boundary_conditions=bc,
         solver_options=opts_full,
         elapsed_seconds=elapsed,
+        T_dew=T_dew_arr,
+        T_margin=T_margin_arr,
+        metastable_mask=metastable_mask,
+        had_metastable=had_metastable,
+        x_dewpoint_crossing=x_dewpoint_crossing,
+        LVF=LVF_arr,
     )
 
 

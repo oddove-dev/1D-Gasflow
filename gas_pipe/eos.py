@@ -44,6 +44,7 @@ _ALLOWED_SET: frozenset[str] = frozenset(ALLOWED_COMPONENTS)
 _iT = CoolProp.iT
 _iP = CoolProp.iP
 _iHmass = CoolProp.iHmass
+_iDmass = CoolProp.iDmass  # density [kg/m^3], used for saturated-phase outputs
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +172,12 @@ class GERGFluid:
         self._cache_max = 200_000
         self._cache_hits = 0
         self._cache_misses = 0
+
+        # Dew-temperature cache: keyed on rounded pressure only. Dew T
+        # depends only on P (and composition, which is fixed per fluid),
+        # so this is a tiny dict that pays for itself once per unique P
+        # along a march. Stores None for failed flashes so we don't retry.
+        self._dew_cache: dict[int, float | None] = {}
 
         logger.debug("GERGFluid created: %s", self._fluid_string[:80])
 
@@ -348,7 +355,34 @@ class GERGFluid:
         the flash failed (e.g. P above the cricondenbar, single-phase
         composition, or a numerical issue) — callers should then leave
         T_dew as NaN at that station.
+
+        Cached on rounded pressure (10 Pa precision) for speed; dew T
+        depends only on P given fixed composition.
+
+        Notes
+        -----
+        CoolProp's HEOS PQ flash for multicomponent mixtures occasionally
+        converges to a non-physical upper root at narrow pressure bands
+        near the cricondenbar (observed for the default Skarv NG mix at
+        P ≈ 44.43 bara: PQ returns T ≈ 1400 K, far above the EOS Tmax of
+        ~685 K). The Newton iteration accepts the spurious root without
+        raising. We defend against this with two cross-checks before
+        accepting the value:
+
+        1. Bound check: T must lie within the EOS [Tmin, Tmax] window.
+        2. Round-trip: a reverse QT flash at the returned T must yield
+           back the requested P. The HEOS QT solver fails (or returns a
+           wildly different P) precisely at the spurious-root pressures,
+           so a successful round-trip is strong evidence the dew T is
+           physical.
+
+        Either failure → return None so the caller treats the station as
+        "dew T unknown" (NaN) rather than firing a false two-phase warning.
         """
+        key = round(P, -1)  # 10 Pa bins
+        if key in self._dew_cache:
+            return self._dew_cache[key]
+
         s = self._state
         # Dew flash needs phase un-specified to find the saturation curve.
         had_phase = True
@@ -356,9 +390,23 @@ class GERGFluid:
             s.unspecify_phase()
         except Exception:
             had_phase = False
+        T_dew: float | None
         try:
             s.update(CoolProp.PQ_INPUTS, P, 1.0)
             T_dew = float(s.T())
+            T_min = float(s.Tmin())
+            T_max = float(s.Tmax())
+            if not (T_min <= T_dew <= T_max):
+                T_dew = None
+            else:
+                # Round-trip verification: dew P at T_dew should equal P.
+                try:
+                    s.update(CoolProp.QT_INPUTS, 1.0, T_dew)
+                    P_back = float(s.p())
+                    if abs(P_back - P) > 1e-3 * max(P, 1.0):
+                        T_dew = None
+                except Exception:
+                    T_dew = None
         except Exception:
             T_dew = None
         finally:
@@ -369,7 +417,111 @@ class GERGFluid:
                     s.specify_phase(CoolProp.iphase_gas)
                 except Exception:
                     pass
+
+        self._dew_cache[key] = T_dew
         return T_dew
+
+    def compute_lvf(self, P: float, h: float) -> float:
+        """Liquid volume fraction at (P, h) via two-phase isenthalpic flash.
+
+        Returns
+        -------
+        float
+            LVF in [0, 1] for a genuine two-phase state, 0.0 if the
+            isenthalpic flash resolves to a single-phase state, or NaN
+            if the flash could not be performed.
+
+        Notes
+        -----
+        CoolProp's HSU_P_flash for HEOS mixtures is unreliable — it
+        often raises "phase envelope must be built" even when an
+        envelope was built, because the envelope is not retained
+        across some `update()` calls on the shared AbstractState.
+
+        We therefore use a PQ-flash bracket-search:
+          * sweep Q ∈ [Q_min, 1] sampling ~10 points
+          * at each, read the saturated mixture enthalpy h_sat(Q)
+          * find the Q where h_sat(Q) == h_meta (linear interpolation
+            between the bracketing samples)
+          * convert the mass-quality Q to volume fraction via the
+            saturated phase densities at that Q.
+        Q values where CoolProp's PQ solver fails are skipped.
+        Returns NaN if no usable bracket can be formed.
+        """
+        s = self._state
+        had_phase = True
+        try:
+            s.unspecify_phase()
+        except Exception:
+            had_phase = False
+
+        try:
+            # Sample h_sat(Q) on a Q grid. Skip Q values where the
+            # mixture flash diverges (CoolProp solver is brittle in
+            # the middle of the dome for HEOS mixtures).
+            Q_grid = [0.001, 0.01, 0.05, 0.1, 0.3, 0.5, 0.7, 0.85,
+                      0.9, 0.95, 0.99, 0.999]
+            samples: list[tuple[float, float, float, float]] = []
+            # Each entry: (Q, h_sat, rho_l, rho_v)
+            for Q in Q_grid:
+                try:
+                    s.update(CoolProp.PQ_INPUTS, P, Q)
+                    h_sat = float(s.hmass())
+                    rho_l = float(s.saturated_liquid_keyed_output(_iDmass))
+                    rho_v = float(s.saturated_vapor_keyed_output(_iDmass))
+                    if rho_l > 0 and rho_v > 0:
+                        samples.append((Q, h_sat, rho_l, rho_v))
+                except Exception:
+                    continue
+
+            if len(samples) < 2:
+                return float("nan")
+
+            # Sort by h_sat for monotone interpolation along the saturation
+            # curve. (h_sat is monotone in Q for fixed P.)
+            samples.sort(key=lambda t: t[1])
+            h_min = samples[0][1]
+            h_max = samples[-1][1]
+
+            if h <= h_min:
+                # Below the lowest sampled h_sat — assume all liquid.
+                return 1.0
+            if h >= h_max:
+                # Above the dew enthalpy — single-phase vapor.
+                return 0.0
+
+            # Linear bracket: find consecutive samples spanning h.
+            for j in range(len(samples) - 1):
+                Q_a, h_a, rho_l_a, rho_v_a = samples[j]
+                Q_b, h_b, rho_l_b, rho_v_b = samples[j + 1]
+                if h_a <= h <= h_b:
+                    if h_b == h_a:
+                        Q = 0.5 * (Q_a + Q_b)
+                        rho_l = 0.5 * (rho_l_a + rho_l_b)
+                        rho_v = 0.5 * (rho_v_a + rho_v_b)
+                    else:
+                        frac = (h - h_a) / (h_b - h_a)
+                        Q = Q_a + frac * (Q_b - Q_a)
+                        rho_l = rho_l_a + frac * (rho_l_b - rho_l_a)
+                        rho_v = rho_v_a + frac * (rho_v_b - rho_v_a)
+                    if Q <= 0.0:
+                        return 1.0
+                    if Q >= 1.0:
+                        return 0.0
+                    if rho_l <= 0.0 or rho_v <= 0.0:
+                        return float("nan")
+                    vol_l = (1.0 - Q) / rho_l
+                    vol_v = Q / rho_v
+                    return vol_l / (vol_l + vol_v)
+            return float("nan")
+        except Exception:
+            return float("nan")
+        finally:
+            if had_phase:
+                try:
+                    s.specify_phase(CoolProp.iphase_gas)
+                except Exception:
+                    pass
 
     @property
     def molar_mass(self) -> float:
