@@ -1,0 +1,390 @@
+"""CoolProp GERG-2008 EOS wrapper with caching.
+
+All thermodynamic property access in the solver goes through this module.
+Nothing else imports CoolProp directly.
+"""
+from __future__ import annotations
+
+import logging
+import warnings
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import TYPE_CHECKING
+
+import CoolProp
+import CoolProp.CoolProp as CP
+from CoolProp.CoolProp import AbstractState
+
+from .errors import EOSOutOfRange, EOSTwoPhase
+
+logger = logging.getLogger(__name__)
+
+ALLOWED_COMPONENTS: tuple[str, ...] = (
+    "Methane",
+    "Ethane",
+    "Propane",
+    "n-Butane",
+    "IsoButane",
+    "n-Pentane",
+    "IsoPentane",
+    "n-Hexane",
+    "Nitrogen",
+    "CarbonDioxide",
+    "HydrogenSulfide",
+    "Water",
+    "Oxygen",
+    "Hydrogen",
+    "Helium",
+    "Argon",
+)
+
+_ALLOWED_SET: frozenset[str] = frozenset(ALLOWED_COMPONENTS)
+
+# CoolProp input/output parameter codes used for partial derivatives
+_iT = CoolProp.iT
+_iP = CoolProp.iP
+_iHmass = CoolProp.iHmass
+
+
+@dataclass(frozen=True, slots=True)
+class FluidState:
+    """Thermodynamic state at a single point.
+
+    Parameters
+    ----------
+    P : float
+        Pressure [Pa].
+    T : float
+        Temperature [K].
+    rho : float
+        Density [kg/m³].
+    h : float
+        Specific enthalpy [J/kg].
+    s : float
+        Specific entropy [J/kg/K].
+    cp : float
+        Isobaric heat capacity [J/kg/K].
+    cv : float
+        Isochoric heat capacity [J/kg/K].
+    mu : float
+        Dynamic viscosity [Pa·s].
+    k : float
+        Thermal conductivity [W/m/K].
+    a : float
+        Speed of sound [m/s].
+    Z : float
+        Compressibility factor [-].
+    mu_JT : float
+        Joule-Thomson coefficient [K/Pa].
+    metastable : bool
+        True if the state was produced by forcing gas-phase extrapolation
+        across the dew curve (i.e. (P, T) is inside the two-phase dome
+        but we evaluated as if it were still single-phase gas). False
+        for normal single-phase states.
+    """
+
+    P: float
+    T: float
+    rho: float
+    h: float
+    s: float
+    cp: float
+    cv: float
+    mu: float
+    k: float
+    a: float
+    Z: float
+    mu_JT: float
+    metastable: bool = False
+
+
+def _normalize_composition(composition: dict[str, float]) -> dict[str, float]:
+    """Validate and normalize a mole-fraction composition dict.
+
+    Parameters
+    ----------
+    composition : dict[str, float]
+        Component name → mole fraction. Must sum to 1.0 within 1e-6.
+
+    Returns
+    -------
+    dict[str, float]
+        Normalized composition.
+
+    Raises
+    ------
+    ValueError
+        If unknown components are present or fractions are non-positive.
+    EOSOutOfRange
+        If composition cannot be normalized.
+    """
+    unknown = set(composition) - _ALLOWED_SET
+    if unknown:
+        raise ValueError(
+            f"Unknown component(s): {sorted(unknown)}. "
+            f"Allowed: {sorted(ALLOWED_COMPONENTS)}"
+        )
+    for name, frac in composition.items():
+        if frac < 0:
+            raise ValueError(f"Negative mole fraction for {name}: {frac}")
+
+    total = sum(composition.values())
+    if total <= 0:
+        raise ValueError("Composition sums to zero or negative.")
+    deviation = abs(total - 1.0)
+    if deviation > 1e-9:
+        warnings.warn(
+            f"Composition sums to {total:.9f}, normalizing. Deviation = {deviation:.2e}",
+            stacklevel=3,
+        )
+    return {k: v / total for k, v in composition.items() if v > 0}
+
+
+def _build_fluid_string(composition: dict[str, float]) -> str:
+    """Build the HEOS fluid string for CoolProp."""
+    parts = [f"{name}[{frac:.10f}]" for name, frac in composition.items()]
+    return "HEOS::" + "&".join(parts)
+
+
+class GERGFluid:
+    """GERG-2008 fluid via CoolProp AbstractState with per-instance LRU cache.
+
+    Parameters
+    ----------
+    composition : dict[str, float]
+        Component name → mole fraction. Will be normalized if needed.
+    """
+
+    def __init__(self, composition: dict[str, float]) -> None:
+        self._composition = _normalize_composition(composition)
+        self._fluid_string = _build_fluid_string(self._composition)
+
+        # Build the AbstractState once — this is the expensive operation
+        names = list(self._composition.keys())
+        fracs = [self._composition[n] for n in names]
+        self._state: AbstractState = AbstractState("HEOS", "&".join(names))
+        self._state.set_mole_fractions(fracs)
+        self._state.specify_phase(CoolProp.iphase_gas)
+
+        # Use a plain dict with bounded size for caching
+        self._cache: dict[tuple[int, int], FluidState] = {}
+        self._cache_max = 200_000
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+        logger.debug("GERGFluid created: %s", self._fluid_string[:80])
+
+    # ------------------------------------------------------------------
+    # Cache helpers
+    # ------------------------------------------------------------------
+
+    def _cache_key(self, P: float, T: float) -> tuple[int, int]:
+        return (round(P, -2), round(T, 3))
+
+    def _evict_cache(self) -> None:
+        # FIFO: remove first inserted items
+        n_remove = self._cache_max // 10
+        keys = list(self._cache)[:n_remove]
+        for k in keys:
+            del self._cache[k]
+
+    # ------------------------------------------------------------------
+    # Low-level AbstractState evaluation
+    # ------------------------------------------------------------------
+
+    def _build_fluid_state(self, P: float, T: float, metastable: bool) -> FluidState:
+        """Read all property fields from the CoolProp state after a successful
+        ``update()`` call and pack them into a :class:`FluidState`.
+
+        Caller is responsible for the ``update()`` and any phase
+        specification dance.
+        """
+        s = self._state
+        rho = s.rhomass()
+        h = s.hmass()
+        entropy = s.smass()
+        cp = s.cpmass()
+        cv = s.cvmass()
+        mu = s.viscosity()
+        k = s.conductivity()
+        a = s.speed_sound()
+        R_spec = 8.31446 / s.molar_mass()  # J/(kg·K)
+        Z = P / (rho * R_spec * T)
+        mu_JT = s.first_partial_deriv(_iT, _iP, _iHmass)
+        return FluidState(
+            P=P, T=T, rho=rho, h=h, s=entropy,
+            cp=cp, cv=cv, mu=mu, k=k, a=a, Z=Z, mu_JT=mu_JT,
+            metastable=metastable,
+        )
+
+    def _eval_state(self, P: float, T: float) -> FluidState:
+        """Compute FluidState from (P, T). No caching.
+
+        If the state lies inside the two-phase dome, force a metastable
+        gas-phase extrapolation rather than raising — the solver handles
+        sub-dew states by continuing on the gas branch and flagging the
+        affected stations. Only a hard EOS failure (still bubbles after
+        the metastable retry) raises ``EOSOutOfRange``.
+        """
+        s = self._state
+        try:
+            s.update(CoolProp.PT_INPUTS, P, T)
+            return self._build_fluid_state(P, T, metastable=False)
+        except Exception as exc:
+            msg = str(exc).lower()
+            two_phase = any(
+                w in msg
+                for w in ("saturated", "two-phase", "two phase", "twophase")
+            )
+            if not two_phase:
+                raise EOSOutOfRange(
+                    f"EOS out of range at P={P/1e5:.3f} bara, T={T:.2f} K: {exc}"
+                ) from exc
+
+            # Metastable extrapolation: force gas-phase and retry. The
+            # GERGFluid is constructed with iphase_gas already specified,
+            # but PT-flash with phase-forcing is solver-state-dependent;
+            # an explicit re-specify before retry is the documented way.
+            try:
+                s.specify_phase(CoolProp.iphase_gas)
+                s.update(CoolProp.PT_INPUTS, P, T)
+                state = self._build_fluid_state(P, T, metastable=True)
+                return state
+            except Exception as retry_exc:
+                raise EOSOutOfRange(
+                    f"EOS metastable retry failed at P={P/1e5:.3f} bara, "
+                    f"T={T:.2f} K: {retry_exc}"
+                ) from retry_exc
+
+    def _eval_state_Ph(self, P: float, h: float) -> FluidState:
+        """Compute FluidState from (P, h). No caching."""
+        s = self._state
+        try:
+            # Temporarily remove phase specification so the Ph flash solver
+            # can search the full valid range without being forced to gas.
+            s.unspecify_phase()
+            s.update(CoolProp.HmassP_INPUTS, h, P)
+            s.specify_phase(CoolProp.iphase_gas)
+
+            T = s.T()
+            rho = s.rhomass()
+            entropy = s.smass()
+            cp = s.cpmass()
+            cv = s.cvmass()
+            mu = s.viscosity()
+            k = s.conductivity()
+            a = s.speed_sound()
+            R_spec = 8.31446 / s.molar_mass()
+            Z = P / (rho * R_spec * T)
+            mu_JT = s.first_partial_deriv(_iT, _iP, _iHmass)
+
+        except Exception as exc:
+            msg = str(exc).lower()
+            if any(w in msg for w in ("saturated", "two-phase", "two phase", "twophase")):
+                raise EOSTwoPhase(
+                    f"Two-phase condition at P={P/1e5:.3f} bara, h={h:.0f} J/kg"
+                ) from exc
+            raise EOSOutOfRange(
+                f"EOS out of range at P={P/1e5:.3f} bara, h={h:.0f} J/kg: {exc}"
+            ) from exc
+
+        return FluidState(
+            P=P, T=T, rho=rho, h=h, s=entropy,
+            cp=cp, cv=cv, mu=mu, k=k, a=a, Z=Z, mu_JT=mu_JT,
+        )
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def props(self, P: float, T: float) -> FluidState:
+        """Return FluidState at (P, T) with caching.
+
+        Parameters
+        ----------
+        P : float
+            Pressure [Pa].
+        T : float
+            Temperature [K].
+
+        Returns
+        -------
+        FluidState
+        """
+        key = self._cache_key(P, T)
+        if key in self._cache:
+            self._cache_hits += 1
+            return self._cache[key]
+
+        self._cache_misses += 1
+        state = self._eval_state(P, T)
+        if len(self._cache) >= self._cache_max:
+            self._evict_cache()
+        self._cache[key] = state
+        return state
+
+    def props_Ph(self, P: float, h: float) -> FluidState:
+        """Return FluidState at (P, h) — isenthalpic flash.
+
+        Parameters
+        ----------
+        P : float
+            Pressure [Pa].
+        h : float
+            Specific enthalpy [J/kg].
+
+        Returns
+        -------
+        FluidState
+        """
+        return self._eval_state_Ph(P, h)
+
+    def dew_temperature(self, P: float) -> float | None:
+        """Return dew-point temperature at pressure P, or None if not computable.
+
+        Used to flag metastable march stations where the gas state has
+        crossed below the dew curve. The CoolProp PQ_INPUTS flash with
+        Q=1 walks the dew curve directly; a return of None signals that
+        the flash failed (e.g. P above the cricondenbar, single-phase
+        composition, or a numerical issue) — callers should then leave
+        T_dew as NaN at that station.
+        """
+        s = self._state
+        # Dew flash needs phase un-specified to find the saturation curve.
+        had_phase = True
+        try:
+            s.unspecify_phase()
+        except Exception:
+            had_phase = False
+        try:
+            s.update(CoolProp.PQ_INPUTS, P, 1.0)
+            T_dew = float(s.T())
+        except Exception:
+            T_dew = None
+        finally:
+            # Restore phase specification so subsequent props() calls
+            # resume on the gas branch.
+            if had_phase:
+                try:
+                    s.specify_phase(CoolProp.iphase_gas)
+                except Exception:
+                    pass
+        return T_dew
+
+    @property
+    def molar_mass(self) -> float:
+        """Molar mass [kg/mol]."""
+        return self._state.molar_mass()
+
+    @property
+    def composition(self) -> dict[str, float]:
+        """Normalized mole-fraction composition."""
+        return dict(self._composition)
+
+    def cache_stats(self) -> dict[str, int]:
+        """Return cache hit/miss statistics."""
+        return {
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "size": len(self._cache),
+        }
