@@ -7,12 +7,20 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 from scipy.optimize import brentq
 
+from .eos import TabulatedFluid, estimate_operating_window
+
+# Env-var override for the default eos_mode. Used by the test suite to
+# force ``direct`` mode without touching every old test — see
+# ``tests/conftest.py``. Production callers should pass eos_mode
+# explicitly; the env var is a back door, not part of the public API.
+_DEFAULT_EOS_MODE_ENV = "GAS_PIPE_DEFAULT_EOS_MODE"
 from .errors import (
     BVPChoked,
     BVPNotBracketedError,
@@ -24,7 +32,7 @@ from .errors import (
 from .segment import bisect_for_choke, estimate_M_downstream, solve_segment
 
 if TYPE_CHECKING:
-    from .eos import GERGFluid
+    from .eos import FluidEOSBase
     from .geometry import Pipe
     from .results import PipeResult
 
@@ -46,7 +54,7 @@ def _build_result(
     mdot: float,
     choked: bool,
     x_choke: float | None,
-    fluid: "GERGFluid",
+    fluid: "FluidEOSBase",
     pipe: "Pipe",
     bc: dict,
     opts: dict,
@@ -206,7 +214,7 @@ def _build_result(
 
 def _aga_estimate_mdot(
     pipe: "Pipe",
-    fluid: "GERGFluid",
+    fluid: "FluidEOSBase",
     P_in: float,
     T_in: float,
     P_out: float,
@@ -216,7 +224,7 @@ def _aga_estimate_mdot(
     Parameters
     ----------
     pipe : Pipe
-    fluid : GERGFluid
+    fluid : FluidEOSBase
     P_in : float  [Pa]
     T_in : float  [K]
     P_out : float [Pa]
@@ -264,7 +272,7 @@ def _aga_estimate_mdot(
 
 def march_ivp(
     pipe: "Pipe",
-    fluid: "GERGFluid",
+    fluid: "FluidEOSBase",
     P_in: float,
     T_in: float,
     mdot: float,
@@ -282,7 +290,7 @@ def march_ivp(
     Parameters
     ----------
     pipe : Pipe
-    fluid : GERGFluid
+    fluid : FluidEOSBase
     P_in : float
         Inlet pressure [Pa].
     T_in : float
@@ -538,7 +546,7 @@ def march_ivp(
 
 def solve_for_mdot(
     pipe: "Pipe",
-    fluid: "GERGFluid",
+    fluid: "FluidEOSBase",
     P_in: float,
     T_in: float,
     P_out: float,
@@ -546,6 +554,11 @@ def solve_for_mdot(
     rtol: float = 1e-5,
     progress_callback: Callable[[str, float], None] | None = None,
     cancel_event: "object | None" = None,
+    eos_mode: str | None = None,
+    table_n_P: int = 50,
+    table_n_T: int = 50,
+    P_range_override: tuple[float, float] | None = None,
+    T_range_override: tuple[float, float] | None = None,
     **ivp_kwargs,
 ) -> "PipeResult":
     """Find mass flow rate such that march_ivp gives the target outlet pressure.
@@ -553,7 +566,7 @@ def solve_for_mdot(
     Parameters
     ----------
     pipe : Pipe
-    fluid : GERGFluid
+    fluid : FluidEOSBase
     P_in : float
         Inlet pressure [Pa].
     T_in : float
@@ -566,6 +579,20 @@ def solve_for_mdot(
         Relative tolerance on P_out match.
     progress_callback : Callable or None
         Called as (stage_name, fraction).
+    eos_mode : {"table", "direct"}
+        ``"table"`` (default) wraps ``fluid`` with a
+        :class:`TabulatedFluid` over an auto-estimated (or overridden)
+        operating window — ~10-100× faster than ``"direct"`` for
+        bracketing-heavy BVPs at the cost of ~0.3% accuracy.
+        ``"direct"`` uses ``fluid`` as-is for every property call. Pass
+        ``"direct"`` when the caller has already wrapped the fluid with
+        a :class:`TabulatedFluid` (e.g. :func:`plateau_sweep`) so the
+        table isn't re-built per BVP.
+    table_n_P, table_n_T : int
+        Grid resolution for the auto-built table (ignored when
+        ``eos_mode="direct"``).
+    P_range_override, T_range_override : tuple or None
+        Override the auto-estimated table window.
     **ivp_kwargs
         Passed to march_ivp.
 
@@ -585,6 +612,38 @@ def solve_for_mdot(
     def _report(stage: str, frac: float) -> None:
         if progress_callback:
             progress_callback(stage, frac)
+
+    # ------------------------------------------------------------------
+    # EOS-mode dispatch. The decision is made once here so the rest of
+    # the BVP loop calls fluid.props uniformly.
+    # ------------------------------------------------------------------
+    if eos_mode is None:
+        eos_mode = os.environ.get(_DEFAULT_EOS_MODE_ENV, "table")
+    if eos_mode == "direct":
+        working_fluid: "FluidEOSBase" = fluid
+        table: TabulatedFluid | None = None
+    elif eos_mode == "table":
+        if P_range_override is not None and T_range_override is not None:
+            P_range, T_range = P_range_override, T_range_override
+        else:
+            P_min, P_max, T_min, T_max = estimate_operating_window(
+                P_in, T_in, P_out, fluid,
+            )
+            P_range = P_range_override if P_range_override is not None else (P_min, P_max)
+            T_range = T_range_override if T_range_override is not None else (T_min, T_max)
+        table = TabulatedFluid(fluid, P_range, T_range, table_n_P, table_n_T)
+        working_fluid = table
+    else:
+        raise ValueError(
+            f"eos_mode must be 'table' or 'direct'; got {eos_mode!r}"
+        )
+
+    def _annotate_eos(result: "PipeResult") -> "PipeResult":
+        """Stamp the result.solver_options with EOS-mode diagnostics."""
+        result.solver_options["eos_mode"] = eos_mode
+        if table is not None:
+            result.solver_options["table_stats"] = table.table_stats()
+        return result
 
     # Cache march_ivp outcomes keyed on rounded mdot. Bisection in
     # _find_critical_mdot revisits the same mdot through closure (the lo/hi
@@ -609,7 +668,7 @@ def solve_for_mdot(
                 raise payload
         try:
             r = march_ivp(
-                pipe, fluid, P_in, T_in, mdot,
+                pipe, working_fluid, P_in, T_in, mdot,
                 cancel_event=cancel_event, **ivp_kwargs
             )
             _march_cache[key] = ("ok", r)
@@ -620,7 +679,7 @@ def solve_for_mdot(
 
     # Build bracket
     if mdot_bracket is None:
-        mdot_mid = _aga_estimate_mdot(pipe, fluid, P_in, T_in, P_out)
+        mdot_mid = _aga_estimate_mdot(pipe, working_fluid, P_in, T_in, P_out)
         mdot_lo_try = mdot_mid * 0.1
         mdot_hi_try = mdot_mid * 10.0
         # Proactive cap: AGA can be wildly off (30×+) for short or low-loss
@@ -628,7 +687,7 @@ def solve_for_mdot(
         # any larger mdot drives the inlet near-sonic or supersonic, which
         # produces degenerate n=2 marches that masquerade as "choked" and
         # confuse the bracket logic.
-        inlet = fluid.props(P_in, T_in)
+        inlet = working_fluid.props(P_in, T_in)
         mdot_hi_M05 = 0.5 * inlet.a * inlet.rho * pipe.area
         if mdot_hi_try > mdot_hi_M05:
             mdot_hi_try = mdot_hi_M05
@@ -700,7 +759,7 @@ def solve_for_mdot(
         _report("bracketing", 0.8)
         try:
             mdot_crit, r_choked_witness = _find_critical_mdot(
-                pipe, fluid, P_in, T_in, P_out, mdot_lo_try, mdot_hi_try,
+                pipe, working_fluid, P_in, T_in, P_out, mdot_lo_try, mdot_hi_try,
                 ivp_kwargs, march_fn=_cached_march
             )
         except Exception as exc:
@@ -722,6 +781,7 @@ def solve_for_mdot(
             result_to_return = r_crit
             result_to_return.choked = True
             result_to_return.x_choke = pipe.length
+            _annotate_eos(result_to_return)
             raise BVPChoked(
                 f"Flow chokes at ṁ_critical = {mdot_crit:.3f} kg/s; "
                 f"target P_out = {P_out/1e5:.3f} bara is unreachable.",
@@ -762,6 +822,7 @@ def solve_for_mdot(
 
     # If this solution itself is choked and P_out_calc > P_target
     if result.choked and float(result.P[-1]) > P_out * (1 + rtol):
+        _annotate_eos(result)
         raise BVPChoked(
             f"BVP choked: ṁ_critical = {mdot_sol:.3f} kg/s.",
             mdot_critical=mdot_sol,
@@ -769,12 +830,99 @@ def solve_for_mdot(
         )
 
     _report("finalizing", 1.0)
-    return result
+    return _annotate_eos(result)
+
+
+def verify_eos_accuracy(
+    pipe: "Pipe",
+    fluid: "FluidEOSBase",
+    P_in: float,
+    T_in: float,
+    P_out: float,
+    table_n_P: int = 50,
+    table_n_T: int = 50,
+    P_range_override: tuple[float, float] | None = None,
+    T_range_override: tuple[float, float] | None = None,
+    cancel_event: "object | None" = None,
+    **ivp_kwargs,
+) -> dict:
+    """Run a BVP both ways (direct and table) and report the deviations.
+
+    Used by the GUI's "Verify table accuracy" button — i.e. it measures
+    how closely the tabulated bilinear lookup tracks direct EOS calls,
+    not the EOS itself against external reference data. Returns a dict
+    the caller can format into a comparison dialog or attach to a
+    summary.
+
+    Returns
+    -------
+    dict
+        Keys: ``result_direct``, ``result_table``, ``mdot_rel_diff``,
+        ``P_out_diff_Pa``, ``T_out_diff_K``, ``x_choke_diff_m``,
+        ``max_rho_rel``, ``max_h_rel``, ``max_a_rel``, ``max_mu_rel``,
+        ``elapsed_direct``, ``elapsed_table``, ``speedup``.
+    """
+    import time as _time
+
+    def _run(mode: str) -> tuple["PipeResult", float]:
+        t = _time.time()
+        try:
+            r = solve_for_mdot(
+                pipe, fluid, P_in, T_in, P_out,
+                eos_mode=mode,
+                table_n_P=table_n_P, table_n_T=table_n_T,
+                P_range_override=P_range_override,
+                T_range_override=T_range_override,
+                cancel_event=cancel_event,
+                **ivp_kwargs,
+            )
+        except BVPChoked as exc:
+            r = exc.result
+        return r, _time.time() - t
+
+    r_direct, t_direct = _run("direct")
+    r_table, t_table = _run("table")
+
+    # Station-by-station deltas. Compare on the shorter array since the
+    # two marches may have different segment counts after adaptive
+    # refinement; resampling onto a common x-grid is more honest than
+    # truncating but for a rough verification the truncation is fine.
+    n = min(len(r_direct.x), len(r_table.x))
+    rho_rel = np.abs(r_table.rho[:n] - r_direct.rho[:n]) / np.maximum(r_direct.rho[:n], 1e-30)
+    h_scale = np.maximum(np.abs(r_direct.h[:n]), 1e4)
+    h_rel = np.abs(r_table.h[:n] - r_direct.h[:n]) / h_scale
+    a_rel = np.abs(r_table.a[:n] - r_direct.a[:n]) / np.maximum(r_direct.a[:n], 1e-30)
+    # Some stations may have NaN mu_JT if EOS partial deriv failed —
+    # nanmax keeps the comparison robust.
+    mu_rel = np.abs(r_table.mu_JT[:n] - r_direct.mu_JT[:n]) / np.maximum(np.abs(r_direct.mu_JT[:n]), 1e-30)
+
+    x_choke_diff: float
+    if r_direct.x_choke is not None and r_table.x_choke is not None:
+        x_choke_diff = abs(r_table.x_choke - r_direct.x_choke)
+    else:
+        x_choke_diff = float("nan")
+
+    return {
+        "result_direct": r_direct,
+        "result_table": r_table,
+        "mdot_rel_diff": abs(r_table.mdot - r_direct.mdot) / max(r_direct.mdot, 1e-30),
+        "P_out_diff_Pa": float(abs(r_table.P[-1] - r_direct.P[-1])),
+        "T_out_diff_K": float(abs(r_table.T[-1] - r_direct.T[-1])),
+        "x_choke_diff_m": x_choke_diff,
+        "max_rho_rel": float(np.nanmax(rho_rel)) if rho_rel.size else 0.0,
+        "max_h_rel": float(np.nanmax(h_rel)) if h_rel.size else 0.0,
+        "max_a_rel": float(np.nanmax(a_rel)) if a_rel.size else 0.0,
+        "max_mu_rel": float(np.nanmax(mu_rel)) if mu_rel.size else 0.0,
+        "elapsed_direct": t_direct,
+        "elapsed_table": t_table,
+        "speedup": t_direct / max(t_table, 1e-9),
+        "table_stats": r_table.solver_options.get("table_stats", {}),
+    }
 
 
 def _find_critical_mdot(
     pipe: "Pipe",
-    fluid: "GERGFluid",
+    fluid: "FluidEOSBase",
     P_in: float,
     T_in: float,
     P_out_target: float,
@@ -859,13 +1007,18 @@ def _find_critical_mdot(
 
 def plateau_sweep(
     pipe: "Pipe",
-    fluid: "GERGFluid",
+    fluid: "FluidEOSBase",
     P_in: float,
     T_in: float,
     P_out_array: "np.ndarray | list[float]",
     ivp_kwargs: dict | None = None,
     cancel_event: "object | None" = None,
     on_point: Callable[[int, int, dict], None] | None = None,
+    eos_mode: str | None = None,
+    table_n_P: int = 50,
+    table_n_T: int = 50,
+    P_range_override: tuple[float, float] | None = None,
+    T_range_override: tuple[float, float] | None = None,
 ) -> list[dict]:
     """Run a BVP at each P_out and collect the (P_out, ṁ) plateau curve.
 
@@ -890,6 +1043,17 @@ def plateau_sweep(
     on_point : callable or None
         Called as ``on_point(idx_completed, total, point_dict)`` after
         each point. ``idx_completed`` is 1-based.
+    eos_mode : {"table", "direct"} or None
+        ``"table"`` (default) builds a single :class:`TabulatedFluid`
+        sized to cover the worst-case BVP probe (lowest P_out → largest
+        ΔP and JT cooling) and reuses it across every probe — this is
+        the dominant speedup for plateau sweeps. ``"direct"`` falls
+        back to the raw EOS for every probe. ``None`` resolves via the
+        same env-var override as :func:`solve_for_mdot`.
+    table_n_P, table_n_T : int
+        Grid resolution for the shared table.
+    P_range_override, T_range_override : tuple or None
+        Override the auto-estimated table window.
 
     Returns
     -------
@@ -900,6 +1064,32 @@ def plateau_sweep(
     """
     if ivp_kwargs is None:
         ivp_kwargs = {}
+
+    if eos_mode is None:
+        eos_mode = os.environ.get(_DEFAULT_EOS_MODE_ENV, "table")
+
+    # Build the shared table here (rather than letting each probe build
+    # its own) so it amortises over the whole sweep — the lowest P_out
+    # is the worst-case window, so any other probe's state is contained.
+    if eos_mode == "table":
+        if P_range_override is not None and T_range_override is not None:
+            P_range, T_range = P_range_override, T_range_override
+        else:
+            P_out_lowest = float(min(P_out_array))
+            P_min, P_max, T_min, T_max = estimate_operating_window(
+                P_in, T_in, P_out_lowest, fluid,
+            )
+            P_range = P_range_override if P_range_override is not None else (P_min, P_max)
+            T_range = T_range_override if T_range_override is not None else (T_min, T_max)
+        working_fluid: "FluidEOSBase" = TabulatedFluid(
+            fluid, P_range, T_range, table_n_P, table_n_T,
+        )
+    elif eos_mode == "direct":
+        working_fluid = fluid
+    else:
+        raise ValueError(
+            f"eos_mode must be 'table' or 'direct'; got {eos_mode!r}"
+        )
 
     points: list[dict] = []
     total = len(P_out_array)
@@ -914,9 +1104,13 @@ def plateau_sweep(
         choked = False
         error_msg: str | None = None
         try:
+            # Pass eos_mode='direct' so solve_for_mdot doesn't re-wrap
+            # the already-tabulated fluid (or re-build a table per point).
             result = solve_for_mdot(
-                pipe, fluid, P_in, T_in, P_out,
-                cancel_event=cancel_event, **ivp_kwargs,
+                pipe, working_fluid, P_in, T_in, P_out,
+                cancel_event=cancel_event,
+                eos_mode="direct",
+                **ivp_kwargs,
             )
         except BVPChoked as exc:
             result = exc.result

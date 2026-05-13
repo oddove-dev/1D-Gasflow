@@ -403,6 +403,38 @@ class PipeResult:
         lines.append(f"  Elapsed:          {self.elapsed_seconds:.1f} s")
         lines.append("")
 
+        # EOS evaluation — how the EOS was evaluated for this run
+        # (tabulated lookup vs direct CoolProp calls). Populated by
+        # solve_for_mdot/plateau_sweep when an eos_mode is selected;
+        # pre-item-2 results or march_ivp paths that didn't go through
+        # solve_for_mdot won't have the key, so the block is conditional.
+        eos_mode = opts.get("eos_mode")
+        if eos_mode is not None:
+            lines.append("EOS evaluation")
+            if eos_mode == "table":
+                stats = opts.get("table_stats", {})
+                n_P = int(stats.get("n_P", 0))
+                n_T = int(stats.get("n_T", 0))
+                P_min_bara = float(stats.get("P_min", 0.0)) / 1e5
+                P_max_bara = float(stats.get("P_max", 0.0)) / 1e5
+                T_min_C = float(stats.get("T_min", 0.0)) - 273.15
+                T_max_C = float(stats.get("T_max", 0.0)) - 273.15
+                n_failed = int(stats.get("n_failed", 0))
+                n_oog = int(stats.get("n_outside_grid", 0))
+                lines.append(
+                    f"  Tabulated ({n_P}×{n_T} grid, "
+                    f"P=[{P_min_bara:.2f}, {P_max_bara:.2f}] bara, "
+                    f"T=[{T_min_C:.1f}, {T_max_C:.1f}] °C)"
+                )
+                lines.append(f"  Out-of-grid fallbacks: {n_oog}")
+                if n_failed > 0:
+                    lines.append(f"  Failed grid points:    {n_failed} (filled by direct EOS at query)")
+            elif eos_mode == "direct":
+                lines.append("  Direct (CoolProp GERG-2008 calls per evaluation)")
+            else:
+                lines.append(f"  {eos_mode}")
+            lines.append("")
+
         # Warnings
         warn_list = self.warnings()
         if warn_list:

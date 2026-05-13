@@ -8,7 +8,14 @@ Public API:
 """
 from __future__ import annotations
 
-from .eos import ALLOWED_COMPONENTS, FluidState, GERGFluid
+from .eos import (
+    ALLOWED_COMPONENTS,
+    FluidEOSBase,
+    FluidState,
+    GERGFluid,
+    TabulatedFluid,
+    estimate_operating_window,
+)
 from .errors import (
     BVPChoked,
     BVPNotBracketedError,
@@ -23,12 +30,15 @@ from .errors import (
 from .fittings import Fitting
 from .geometry import Pipe, PipeSection
 from .results import PipeResult
-from .solver import march_ivp, plateau_sweep, solve_for_mdot
+from .solver import march_ivp, plateau_sweep, solve_for_mdot, verify_eos_accuracy
 
 __all__ = [
     "GERGFluid",
+    "TabulatedFluid",
+    "FluidEOSBase",
     "FluidState",
     "ALLOWED_COMPONENTS",
+    "estimate_operating_window",
     "Pipe",
     "PipeSection",
     "Fitting",
@@ -36,6 +46,7 @@ __all__ = [
     "march_ivp",
     "solve_for_mdot",
     "plateau_sweep",
+    "verify_eos_accuracy",
     "GasPipeError",
     "EOSOutOfRange",
     "EOSTwoPhase",

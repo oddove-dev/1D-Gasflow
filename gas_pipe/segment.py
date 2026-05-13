@@ -14,7 +14,7 @@ from .errors import ChokeReached, SegmentConvergenceError
 from .friction import darcy_friction
 
 if TYPE_CHECKING:
-    from .eos import FluidState, GERGFluid
+    from .eos import FluidEOSBase, FluidState
     from .geometry import Pipe
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ def _default_segment_info() -> dict:
 def _segment_residuals(
     P2: float,
     T2: float,
-    fluid: "GERGFluid",
+    fluid: "FluidEOSBase",
     pipe: "Pipe",
     x1: float,
     x2: float,
@@ -158,7 +158,7 @@ def estimate_M_downstream(
 
 def _initial_guess(
     state1: "FluidState",
-    fluid: "GERGFluid",
+    fluid: "FluidEOSBase",
     pipe: "Pipe",
     x1: float,
     x2: float,
@@ -193,7 +193,7 @@ def _initial_guess(
 
 
 def solve_segment(
-    fluid: "GERGFluid",
+    fluid: "FluidEOSBase",
     pipe: "Pipe",
     x_i: float,
     x_ip1: float,
@@ -209,7 +209,7 @@ def solve_segment(
 
     Parameters
     ----------
-    fluid : GERGFluid
+    fluid : FluidEOSBase
     pipe : Pipe
     x_i : float
         Upstream station position [m].
@@ -511,7 +511,7 @@ def solve_segment(
 
 
 def bisect_for_choke(
-    fluid: "GERGFluid",
+    fluid: "FluidEOSBase",
     pipe: "Pipe",
     x_i: float,
     dx_attempted: float,
@@ -525,7 +525,7 @@ def bisect_for_choke(
 
     Parameters
     ----------
-    fluid : GERGFluid
+    fluid : FluidEOSBase
     pipe : Pipe
     x_i : float
         Upstream station [m].

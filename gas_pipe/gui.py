@@ -5,6 +5,7 @@ This module hosts ``MainWindow`` and the ``main()`` entry point.
 from __future__ import annotations
 
 import json
+import math
 import queue
 import re
 import threading
@@ -24,12 +25,13 @@ from .errors import (
     SegmentConvergenceError,
     SolverCancelled,
 )
-from .eos import GERGFluid
+from .eos import GERGFluid, TabulatedFluid, estimate_operating_window
 from .geometry import Pipe, PipeSection
 from .gui_widgets import CompositionEditor
-from .solver import march_ivp, solve_for_mdot
+from .solver import march_ivp, solve_for_mdot, verify_eos_accuracy
 
 if TYPE_CHECKING:
+    from .eos import FluidEOSBase
     from .results import PipeResult
 
 
@@ -187,6 +189,19 @@ _SKARV_SOLVER = {
     "min_dx_mm": 1.0,
 }
 
+_SKARV_EOS = {
+    "eos_mode": "table",
+    "table_n_P": 50,
+    "table_n_T": 50,
+    "override_window": False,
+    # P/T window numbers are auto-estimated by default. The user types
+    # absolute values only when override_window is True.
+    "P_min_bara": "",
+    "P_max_bara": "",
+    "T_min_C": "",
+    "T_max_C": "",
+}
+
 _FRICTION_MODELS = ("blended", "chen", "colebrook", "laminar")
 
 _STATION_COLUMNS = (
@@ -320,6 +335,15 @@ class MainWindow:
         self.var_mach_warn = tk.StringVar(value=str(_SKARV_SOLVER["mach_warning"]))
         self.var_mach_choke = tk.StringVar(value=str(_SKARV_SOLVER["mach_choke"]))
         self.var_min_dx_mm = tk.StringVar(value=str(_SKARV_SOLVER["min_dx_mm"]))
+        # EOS evaluation (item 2 — tabulated EOS for performance)
+        self.var_eos_mode = tk.StringVar(value=str(_SKARV_EOS["eos_mode"]))
+        self.var_table_n_P = tk.StringVar(value=str(_SKARV_EOS["table_n_P"]))
+        self.var_table_n_T = tk.StringVar(value=str(_SKARV_EOS["table_n_T"]))
+        self.var_eos_override = tk.BooleanVar(value=bool(_SKARV_EOS["override_window"]))
+        self.var_eos_P_min_bara = tk.StringVar(value=str(_SKARV_EOS["P_min_bara"]))
+        self.var_eos_P_max_bara = tk.StringVar(value=str(_SKARV_EOS["P_max_bara"]))
+        self.var_eos_T_min_C = tk.StringVar(value=str(_SKARV_EOS["T_min_C"]))
+        self.var_eos_T_max_C = tk.StringVar(value=str(_SKARV_EOS["T_max_C"]))
         # Status
         self.var_status = tk.StringVar(value="idle")
         # Solver-options collapsed state
@@ -440,8 +464,11 @@ class MainWindow:
         # Section 4 — Solver options (collapsible)
         self._build_solver_section(outer).grid(row=3, column=0, sticky="ew", pady=6)
 
-        # Section 5 — Run controls
-        self._build_run_controls(outer).grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        # Section 5 — EOS evaluation (tabulated vs direct)
+        self._build_eos_section(outer).grid(row=4, column=0, sticky="ew", pady=6)
+
+        # Section 6 — Run controls
+        self._build_run_controls(outer).grid(row=5, column=0, sticky="ew", pady=(6, 0))
 
     def _build_geometry_section(self, parent: tk.Misc) -> ttk.LabelFrame:
         f = ttk.LabelFrame(parent, text="Pipe geometry sections", padding=6)
@@ -701,6 +728,113 @@ class MainWindow:
 
         f.grid(row=1, column=0, sticky="ew", pady=(2, 0))
         return outer
+
+    def _build_eos_section(self, parent: tk.Misc) -> ttk.LabelFrame:
+        """EOS-evaluation panel: tabulated vs direct, grid size, window override."""
+        f = ttk.LabelFrame(parent, text="EOS evaluation", padding=6)
+        f.columnconfigure(1, weight=1)
+        v = self._validate_cmd
+
+        # Radio buttons for mode.
+        mode_row = ttk.Frame(f)
+        mode_row.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Radiobutton(
+            mode_row, text="Tabulated (fast)",
+            variable=self.var_eos_mode, value="table",
+            command=self._on_eos_mode_changed,
+        ).pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(
+            mode_row, text="Direct (precision)",
+            variable=self.var_eos_mode, value="direct",
+            command=self._on_eos_mode_changed,
+        ).pack(side="left")
+
+        # Grid resolution row (P × T).
+        grid_row = ttk.Frame(f)
+        grid_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Label(grid_row, text="Grid resolution P × T:").pack(side="left", padx=(0, 6))
+        self._eos_nP_entry = ttk.Entry(
+            grid_row, textvariable=self.var_table_n_P, width=5,
+            justify="right", validate="key", validatecommand=v,
+        )
+        self._eos_nP_entry.pack(side="left")
+        ttk.Label(grid_row, text=" × ").pack(side="left")
+        self._eos_nT_entry = ttk.Entry(
+            grid_row, textvariable=self.var_table_n_T, width=5,
+            justify="right", validate="key", validatecommand=v,
+        )
+        self._eos_nT_entry.pack(side="left")
+
+        # Override window checkbox + entry rows.
+        self._eos_override_check = ttk.Checkbutton(
+            f, text="Override operating window",
+            variable=self.var_eos_override,
+            command=self._on_eos_override_changed,
+        )
+        self._eos_override_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        p_row = ttk.Frame(f)
+        p_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=1)
+        ttk.Label(p_row, text="P [bara]:").pack(side="left", padx=(16, 6))
+        self._eos_P_min_entry = ttk.Entry(
+            p_row, textvariable=self.var_eos_P_min_bara, width=8,
+            justify="right", validate="key", validatecommand=v,
+        )
+        self._eos_P_min_entry.pack(side="left")
+        ttk.Label(p_row, text=" to ").pack(side="left")
+        self._eos_P_max_entry = ttk.Entry(
+            p_row, textvariable=self.var_eos_P_max_bara, width=8,
+            justify="right", validate="key", validatecommand=v,
+        )
+        self._eos_P_max_entry.pack(side="left")
+
+        t_row = ttk.Frame(f)
+        t_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=1)
+        ttk.Label(t_row, text="T [°C]:").pack(side="left", padx=(16, 6))
+        self._eos_T_min_entry = ttk.Entry(
+            t_row, textvariable=self.var_eos_T_min_C, width=8,
+            justify="right", validate="key", validatecommand=v,
+        )
+        self._eos_T_min_entry.pack(side="left")
+        ttk.Label(t_row, text=" to ").pack(side="left")
+        self._eos_T_max_entry = ttk.Entry(
+            t_row, textvariable=self.var_eos_T_max_C, width=8,
+            justify="right", validate="key", validatecommand=v,
+        )
+        self._eos_T_max_entry.pack(side="left")
+
+        # "Verify table accuracy" button — compares table interpolation
+        # against direct EOS for the current case (not EOS-vs-reference).
+        self._btn_verify_eos = ttk.Button(
+            f, text="Verify table accuracy",
+            command=self._action_verify_eos,
+        )
+        self._btn_verify_eos.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        # Initial enable/disable state.
+        self._on_eos_mode_changed()
+        return f
+
+    def _on_eos_mode_changed(self) -> None:
+        """Enable/disable grid + override widgets based on the EOS-mode radio."""
+        is_table = self.var_eos_mode.get() == "table"
+        state = "normal" if is_table else "disabled"
+        self._eos_nP_entry.configure(state=state)
+        self._eos_nT_entry.configure(state=state)
+        self._eos_override_check.configure(state=state)
+        self._btn_verify_eos.configure(state=state)
+        self._on_eos_override_changed()
+
+    def _on_eos_override_changed(self) -> None:
+        """Enable/disable the four P/T entries based on the override checkbox."""
+        is_table = self.var_eos_mode.get() == "table"
+        is_override = self.var_eos_override.get()
+        state = "normal" if (is_table and is_override) else "disabled"
+        for entry in (
+            self._eos_P_min_entry, self._eos_P_max_entry,
+            self._eos_T_min_entry, self._eos_T_max_entry,
+        ):
+            entry.configure(state=state)
 
     def _build_run_controls(self, parent: tk.Misc) -> ttk.LabelFrame:
         f = ttk.LabelFrame(parent, text="Run", padding=6)
@@ -1100,11 +1234,46 @@ class MainWindow:
             "min_dx": min_dx_m,
         }
 
+        # EOS evaluation options.
+        eos_mode = self.var_eos_mode.get().strip()
+        if eos_mode not in ("table", "direct"):
+            raise _InputValidationError(
+                f"EOS mode {eos_mode!r} must be 'table' or 'direct'."
+            )
+        eos_kwargs: dict[str, Any] = {"eos_mode": eos_mode}
+        if eos_mode == "table":
+            n_P = _parse_positive_int(self.var_table_n_P.get(), "Grid n_P")
+            n_T = _parse_positive_int(self.var_table_n_T.get(), "Grid n_T")
+            if n_P < 2 or n_T < 2:
+                raise _InputValidationError("EOS grid must be at least 2×2.")
+            eos_kwargs["table_n_P"] = n_P
+            eos_kwargs["table_n_T"] = n_T
+            if self.var_eos_override.get():
+                P_min = _parse_positive_float(
+                    self.var_eos_P_min_bara.get(), "EOS P_min"
+                ) * 1e5
+                P_max = _parse_positive_float(
+                    self.var_eos_P_max_bara.get(), "EOS P_max"
+                ) * 1e5
+                T_min = _parse_float(self.var_eos_T_min_C.get(), "EOS T_min") + 273.15
+                T_max = _parse_float(self.var_eos_T_max_C.get(), "EOS T_max") + 273.15
+                if P_max <= P_min:
+                    raise _InputValidationError(
+                        f"EOS P window inverted: {P_min/1e5:.2f} ≥ {P_max/1e5:.2f} bara."
+                    )
+                if T_max <= T_min:
+                    raise _InputValidationError(
+                        f"EOS T window inverted: {T_min-273.15:.1f} ≥ {T_max-273.15:.1f} °C."
+                    )
+                eos_kwargs["P_range_override"] = (P_min, P_max)
+                eos_kwargs["T_range_override"] = (T_min, T_max)
+
         return {
             "composition": composition,
             "pipe_kwargs": pipe_kwargs,
             "bc": bc,
             "solver_kwargs": solver_kwargs,
+            "eos_kwargs": eos_kwargs,
         }
 
     # ------------------------------------------------------------------
@@ -1158,19 +1327,42 @@ class MainWindow:
 
         bc = inputs["bc"]
         solver_kwargs = inputs["solver_kwargs"]
+        eos_kwargs = inputs["eos_kwargs"]
+
+        # IVP doesn't take eos_mode (march_ivp's signature); if the user
+        # picked table mode and IVP, wrap the fluid up-front so the march
+        # still benefits — defensive window since IVP has no P_out target.
+        def _wrap_fluid_for_ivp() -> "FluidEOSBase":
+            if eos_kwargs.get("eos_mode") != "table":
+                return fluid
+            P_range = eos_kwargs.get("P_range_override")
+            T_range = eos_kwargs.get("T_range_override")
+            if P_range is None:
+                # IVP: no P_out → pessimistic window (5% of P_in to 110% P_in,
+                # T_in-100 K to T_in+30 K).
+                P_range = (0.05 * bc["P_in"], 1.1 * bc["P_in"])
+            if T_range is None:
+                T_range = (bc["T_in"] - 100.0, bc["T_in"] + 30.0)
+            return TabulatedFluid(
+                fluid, P_range, T_range,
+                eos_kwargs.get("table_n_P", 50),
+                eos_kwargs.get("table_n_T", 50),
+            )
 
         # Define the work the worker thread will do. Closes over `bc`,
         # `solver_kwargs`, `fluid`, `pipe`, and the worker's cancel_event.
         def _do_solve() -> "PipeResult":
             cancel_event = self._worker.cancel_event
             if bc["mode"] == "IVP":
+                wrapped = _wrap_fluid_for_ivp()
                 return march_ivp(
-                    pipe, fluid, bc["P_in"], bc["T_in"], bc["mdot"],
+                    pipe, wrapped, bc["P_in"], bc["T_in"], bc["mdot"],
                     cancel_event=cancel_event, **solver_kwargs,
                 )
             return solve_for_mdot(
                 pipe, fluid, bc["P_in"], bc["T_in"], bc["P_out"],
-                cancel_event=cancel_event, **solver_kwargs,
+                cancel_event=cancel_event,
+                **eos_kwargs, **solver_kwargs,
             )
 
         # ---- UI: enter "running" state ----------------------------------
@@ -1179,6 +1371,162 @@ class MainWindow:
         self._worker.run_async(_do_solve)
         self._poll_after_id = self.root.after(100, self._poll_solver_queue)
         self._tick_after_id = self.root.after(500, self._tick_elapsed)
+
+    def _action_verify_eos(self) -> None:
+        """Run the current BVP case both ways (table vs direct), show deltas.
+
+        Disabled when mode is IVP (no P_out target → no direct-vs-table
+        comparison to run). The verify happens off the Tk thread via the
+        existing SolverWorker so the window stays responsive.
+        """
+        if self._worker.is_running():
+            return
+
+        try:
+            inputs = self._gather_inputs()
+        except _InputValidationError as exc:
+            messagebox.showerror("Invalid input", str(exc), parent=self.root)
+            return
+
+        bc = inputs["bc"]
+        if bc["mode"] != "BVP":
+            messagebox.showinfo(
+                "Verify table accuracy",
+                "Table-accuracy verification compares two BVP solves "
+                "(table interpolation vs direct EOS). Switch the mode "
+                "to BVP and try again.",
+                parent=self.root,
+            )
+            return
+
+        try:
+            fluid = GERGFluid(inputs["composition"])
+            pipe = _build_pipe(inputs["pipe_kwargs"])
+        except Exception as exc:
+            self._show_solver_error(
+                f"Setup error: {type(exc).__name__}",
+                "Could not construct fluid/pipe from inputs.", exc,
+            )
+            return
+
+        solver_kwargs = inputs["solver_kwargs"]
+        eos_kwargs = inputs["eos_kwargs"]
+        # Strip eos_mode from eos_kwargs since verify_eos_accuracy runs
+        # both modes internally; pass the table-sizing kwargs through.
+        table_kwargs = {k: v for k, v in eos_kwargs.items() if k != "eos_mode"}
+
+        def _do_verify() -> dict:
+            return verify_eos_accuracy(
+                pipe, fluid, bc["P_in"], bc["T_in"], bc["P_out"],
+                cancel_event=self._worker.cancel_event,
+                **table_kwargs, **solver_kwargs,
+            )
+
+        self._current_run_kind = "verify"
+        self._enter_running_state()
+        self.var_status.set("Verifying table accuracy…")
+        self._worker.run_async(_do_verify)
+        self._poll_after_id = self.root.after(100, self._poll_solver_queue)
+        self._tick_after_id = self.root.after(500, self._tick_elapsed)
+
+    def _show_eos_verify_dialog(self, report: dict) -> None:
+        """Modal dialog summarising the table-accuracy verification report."""
+        win = tk.Toplevel(self.root)
+        win.title("Verify table accuracy")
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+
+        body = ttk.Frame(win, padding=12)
+        body.pack(fill="both", expand=True)
+
+        rel_mdot_pct = report["mdot_rel_diff"] * 100
+        verdict_ok = (
+            rel_mdot_pct < 0.5
+            and report["P_out_diff_Pa"] < 50e3
+            and report["T_out_diff_K"] < 1.0
+        )
+        verdict_text = (
+            "Table accuracy acceptable for engineering use."
+            if verdict_ok else
+            "Deviations exceed typical engineering tolerance — "
+            "consider Direct mode, a finer grid, or a tighter override window."
+        )
+        verdict_colour = "#1a7c1a" if verdict_ok else "#a63a00"
+
+        ttk.Label(
+            body, text="Table interpolation vs direct EOS — current BVP case",
+            font=("TkDefaultFont", 11, "bold"),
+        ).pack(anchor="w", pady=(0, 2))
+        ttk.Label(
+            body,
+            text="(verifies bilinear lookup against the underlying GERG-2008 calls)",
+            foreground="#555555",
+        ).pack(anchor="w", pady=(0, 6))
+
+        rows = [
+            ("Δṁ_critical",
+             f"{rel_mdot_pct:.3f}%  "
+             f"(direct={report['result_direct'].mdot:.2f}, "
+             f"table={report['result_table'].mdot:.2f} kg/s)"),
+            ("ΔP_out",
+             f"{report['P_out_diff_Pa']/1e3:.2f} kPa"),
+            ("ΔT_out",
+             f"{report['T_out_diff_K']:.3f} K"),
+            ("Δx_choke",
+             "n/a"
+             if not math.isfinite(report["x_choke_diff_m"])
+             else f"{report['x_choke_diff_m']:.3f} m"),
+            ("Max station Δρ", f"{report['max_rho_rel']*100:.3f}%"),
+            ("Max station Δh", f"{report['max_h_rel']*100:.3f}%"),
+            ("Max station Δa", f"{report['max_a_rel']*100:.3f}%"),
+            ("Max station Δμ_JT", f"{report['max_mu_rel']*100:.3f}%"),
+            ("Direct mode elapsed", f"{report['elapsed_direct']:.1f} s"),
+            ("Tabulated elapsed", f"{report['elapsed_table']:.1f} s"),
+            ("Speedup", f"{report['speedup']:.1f}×"),
+        ]
+        for i, (label, value) in enumerate(rows):
+            ttk.Label(body, text=label, anchor="w").grid(
+                row=i + 1, column=0, sticky="w", padx=(0, 12), pady=1
+            )
+            ttk.Label(body, text=value, anchor="w").grid(
+                row=i + 1, column=1, sticky="w", pady=1
+            )
+
+        stats = report.get("table_stats") or {}
+        if stats:
+            ttk.Separator(body, orient="horizontal").grid(
+                row=len(rows) + 1, column=0, columnspan=2, sticky="ew", pady=6
+            )
+            ttk.Label(
+                body,
+                text=(
+                    f"Table: {int(stats.get('n_P', 0))}×{int(stats.get('n_T', 0))} grid, "
+                    f"P=[{stats.get('P_min', 0)/1e5:.2f}, "
+                    f"{stats.get('P_max', 0)/1e5:.2f}] bara, "
+                    f"T=[{stats.get('T_min', 0)-273.15:.1f}, "
+                    f"{stats.get('T_max', 0)-273.15:.1f}] °C"
+                ),
+                anchor="w",
+            ).grid(row=len(rows) + 2, column=0, columnspan=2, sticky="w")
+            ttk.Label(
+                body,
+                text=(
+                    f"Failed grid points: {int(stats.get('n_failed', 0))}, "
+                    f"Out-of-grid fallbacks: {int(stats.get('n_outside_grid', 0))}"
+                ),
+                anchor="w",
+            ).grid(row=len(rows) + 3, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(
+            body, text=verdict_text, foreground=verdict_colour,
+            wraplength=420, justify="left",
+        ).grid(row=len(rows) + 4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        ttk.Button(body, text="Close", command=win.destroy).grid(
+            row=len(rows) + 5, column=0, columnspan=2, pady=(10, 0)
+        )
+        win.bind("<Escape>", lambda _e: win.destroy())
 
     def _action_cancel_run(self) -> None:
         """User clicked Cancel — request cooperative cancellation."""
@@ -1241,10 +1589,20 @@ class MainWindow:
         kind = msg[0]
         self._exit_running_state()
         is_sweep = self._current_run_kind == "sweep"
+        is_verify = self._current_run_kind == "verify"
 
         if kind == "ok":
             _, result, elapsed = msg
-            if is_sweep:
+            if is_verify:
+                # result here is the dict returned by verify_eos_accuracy
+                # (table vs direct comparison, not EOS-vs-reference).
+                self.var_status.set(
+                    f"Table verified — Δṁ = {result['mdot_rel_diff']*100:.3f}% "
+                    f"({elapsed:.1f} s)"
+                )
+                self._status_label.configure(foreground="")
+                self._show_eos_verify_dialog(result)
+            elif is_sweep:
                 self._populate_sweep_tab(result)
                 n_choked = sum(1 for p in result if p["choked"])
                 self.var_status.set(
@@ -1360,6 +1718,7 @@ class MainWindow:
 
         bc = inputs["bc"]
         solver_kwargs = inputs["solver_kwargs"]
+        eos_kwargs = inputs["eos_kwargs"]
 
         # P_out schedule: 8 points log-spaced from 0.9·P_in to 0.05·P_in.
         # Order high → low so a true choke plateau appears as a flat tail
@@ -1383,6 +1742,7 @@ class MainWindow:
                 ivp_kwargs=solver_kwargs,
                 cancel_event=self._worker.cancel_event,
                 on_point=_on_point,
+                **eos_kwargs,
             )
 
         self._current_run_kind = "sweep"
