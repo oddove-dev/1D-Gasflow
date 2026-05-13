@@ -55,6 +55,8 @@ def _default_segment_info() -> dict:
         "dP_elev": 0.0,
         "dP_fitting": 0.0,
         "q_seg": 0.0,
+        "A_out": float("nan"),
+        "section_transition": None,
     }
 
 
@@ -77,8 +79,10 @@ def _segment_residuals(
         (R_momentum, R_energy, state_2)
     """
     state2 = fluid.props(P2, T2)
-    A = pipe.area
-    D = pipe.inner_diameter
+    x_mid = 0.5 * (x1 + x2)
+    sec, _, _ = pipe.section_at(x_mid)
+    A = sec.area
+    D = sec.inner_diameter
     dx = x2 - x1
 
     u1 = mdot / (state1.rho * A)
@@ -94,11 +98,10 @@ def _segment_residuals(
     u_avg = mdot / (rho_avg * A)
 
     Re = rho_avg * u_avg * D / mu_avg
-    f = darcy_friction(Re, pipe.eps_over_D, friction_model)
+    f = darcy_friction(Re, sec.eps_over_D, friction_model)
 
     dP_fric = f * (dx / D) * rho_avg * u_avg ** 2 / 2.0
     dP_acc = (mdot / A) ** 2 * (1.0 / state2.rho - 1.0 / state1.rho)
-    x_mid = 0.5 * (x1 + x2)
     dz = pipe.z(x2) - pipe.z(x1)
     dP_elev = rho_avg * _G * dz
 
@@ -106,8 +109,8 @@ def _segment_residuals(
 
     # Heat per unit mass
     T_amb_mid = pipe.T_amb(x_mid)
-    U_mid = pipe.U(x_mid)
-    D_o = pipe.D_o()
+    U_mid = sec.overall_U
+    D_o = sec.D_o()
     q = U_mid * math.pi * D_o * dx * (T_amb_mid - T_avg) / mdot
 
     h1 = state1.h
@@ -163,13 +166,15 @@ def _initial_guess(
     friction_model: str,
 ) -> tuple[float, float]:
     """Explicit-Euler initial guess for (P2, T2)."""
-    A = pipe.area
-    D = pipe.inner_diameter
+    x_mid = 0.5 * (x1 + x2)
+    sec, _, _ = pipe.section_at(x_mid)
+    A = sec.area
+    D = sec.inner_diameter
     dx = x2 - x1
     rho1 = state1.rho
     u1 = mdot / (rho1 * A)
     Re1 = rho1 * u1 * D / state1.mu
-    f1 = darcy_friction(Re1, pipe.eps_over_D, friction_model)
+    f1 = darcy_friction(Re1, sec.eps_over_D, friction_model)
     dz = pipe.z(x2) - pipe.z(x1)
 
     P2_guess = state1.P - f1 * (dx / D) * rho1 * u1 ** 2 / 2.0 - rho1 * _G * dz
@@ -177,10 +182,9 @@ def _initial_guess(
 
     # Joule-Thomson estimate for temperature
     dP = P2_guess - state1.P
-    x_mid = 0.5 * (x1 + x2)
     T_amb_mid = pipe.T_amb(x_mid)
-    U_mid = pipe.U(x_mid)
-    D_o = pipe.D_o()
+    U_mid = sec.overall_U
+    D_o = sec.D_o()
     heat_term = U_mid * math.pi * D_o * dx * (T_amb_mid - state1.T) / (mdot * state1.cp) if mdot > 0 else 0.0
     T2_guess = state1.T + state1.mu_JT * dP + heat_term
     T2_guess = max(min(T2_guess, 1000.0), 100.0)
@@ -225,8 +229,10 @@ def solve_segment(
     tuple[FluidState, dict]
         Downstream state and info dict with diagnostics.
     """
-    A = pipe.area
-    D = pipe.inner_diameter
+    x_mid = 0.5 * (x_i + x_ip1)
+    sec, _, _ = pipe.section_at(x_mid)
+    A = sec.area
+    D = sec.inner_diameter
     dx = x_ip1 - x_i
 
     # ------------------------------------------------------------------
@@ -353,7 +359,7 @@ def solve_segment(
     mu_avg = state_avg.mu
     u_avg = mdot / (rho_avg * A)
     Re = rho_avg * u_avg * D / mu_avg
-    f_val = darcy_friction(Re, pipe.eps_over_D, friction_model)
+    f_val = darcy_friction(Re, sec.eps_over_D, friction_model)
 
     u2 = mdot / (state2.rho * A)
     M_ip1 = u2 / state2.a
@@ -363,10 +369,9 @@ def solve_segment(
     dz = pipe.z(x_ip1) - pipe.z(x_i)
     dP_elev = rho_avg * _G * dz
 
-    x_mid = 0.5 * (x_i + x_ip1)
     T_amb_mid = pipe.T_amb(x_mid)
-    U_mid = pipe.U(x_mid)
-    D_o = pipe.D_o()
+    U_mid = sec.overall_U
+    D_o = sec.D_o()
     q_seg = U_mid * math.pi * D_o * dx * (T_amb_mid - 0.5 * (state_i.T + T2)) / mdot
 
     # ------------------------------------------------------------------
@@ -412,8 +417,76 @@ def solve_segment(
             logger.debug("Fitting %s caused choke at x=%.3f m", ft.name, ft.location)
             break
 
-    # Final Mach
-    u_final = mdot / (state2.rho * A)
+    # ------------------------------------------------------------------
+    # Section boundary transition — applied when x_ip1 lands exactly on
+    # an interior boundary between two PipeSections of different area.
+    # Borda-Carnot loss for expansions, Crane K-factor for contractions.
+    # The post-transition state2 is in the downstream section, so the
+    # caller must use A_out (returned in info) for the next iteration.
+    # ------------------------------------------------------------------
+    section_transition: dict | None = None
+    A_out = A
+    boundary_idx = pipe.is_at_section_boundary(x_ip1)
+    if boundary_idx is not None and not choked_fitting:
+        section_up = pipe.sections[boundary_idx]
+        section_dn = pipe.sections[boundary_idx + 1]
+        A_up = section_up.area
+        A_dn = section_dn.area
+        if abs(A_dn - A_up) > 1e-15 * A_up:
+            rho_pre = state2.rho
+            u_up = mdot / (rho_pre * A_up)
+            u_dn = mdot / (rho_pre * A_dn)
+
+            if A_dn > A_up:
+                # Borda-Carnot expansion loss
+                beta = A_up / A_dn
+                dP_loss = 0.5 * rho_pre * u_up ** 2 * (1.0 - beta) ** 2
+                t_type = "expansion"
+            else:
+                # Sudden contraction — Crane TP-410 K = 0.5·(1 − β),
+                # referred to the downstream velocity head.
+                beta = A_dn / A_up
+                K_c = 0.5 * (1.0 - beta)
+                dP_loss = 0.5 * rho_pre * u_dn ** 2 * K_c
+                t_type = "contraction"
+
+            # Acceleration term at constant ρ across the transition.
+            # Negative for expansion (pressure rises), positive for
+            # contraction (additional drop).
+            dP_acc_trans = 0.5 * rho_pre * (u_dn ** 2 - u_up ** 2)
+            dP_total = dP_loss + dP_acc_trans
+            P_new = max(state2.P - dP_total, 100.0)
+
+            # CoolProp's HSU_P_flash for HEOS mixtures raises
+            # "phase envelope must be built" — the JT path is robust
+            # and fast for any composition, so we skip props_Ph for
+            # mixtures rather than paying the failed-flash overhead
+            # (and historically corrupting the AbstractState phase spec).
+            if fluid.is_mixture:
+                state2 = fluid.props_Ph_via_jt(P_new, state2)
+            else:
+                try:
+                    state2 = fluid.props_Ph(P_new, state2.h)
+                except Exception as exc:
+                    logger.debug("props_Ph failed at section boundary x=%.3f m: %s; "
+                                 "falling back to JT estimate.", x_ip1, exc)
+                    state2 = fluid.props_Ph_via_jt(P_new, state2)
+
+            A_out = A_dn
+            section_transition = {
+                "x": x_ip1,
+                "from_section": boundary_idx,
+                "to_section": boundary_idx + 1,
+                "A_up": A_up,
+                "A_dn": A_dn,
+                "type": t_type,
+                "dP": dP_total,
+                "dP_loss": dP_loss,
+                "dP_acc": dP_acc_trans,
+            }
+
+    # Final Mach — use A_out so post-transition Mach uses A_dn.
+    u_final = mdot / (state2.rho * A_out)
     M_final = u_final / state2.a
 
     info = {
@@ -430,6 +503,8 @@ def solve_segment(
         "dP_elev": dP_elev,
         "dP_fitting": dP_fitting_total,
         "q_seg": q_seg,
+        "A_out": A_out,
+        "section_transition": section_transition,
     }
 
     return state2, info

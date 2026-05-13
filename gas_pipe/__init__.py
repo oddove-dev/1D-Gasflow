@@ -21,7 +21,7 @@ from .errors import (
     SolverCancelled,
 )
 from .fittings import Fitting
-from .geometry import Pipe
+from .geometry import Pipe, PipeSection
 from .results import PipeResult
 from .solver import march_ivp, plateau_sweep, solve_for_mdot
 
@@ -30,6 +30,7 @@ __all__ = [
     "FluidState",
     "ALLOWED_COMPONENTS",
     "Pipe",
+    "PipeSection",
     "Fitting",
     "PipeResult",
     "march_ivp",

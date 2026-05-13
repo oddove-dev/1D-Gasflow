@@ -137,6 +137,11 @@ class PipeResult:
     x_dewpoint_crossing: float | None = None
     LVF: np.ndarray = field(default_factory=lambda: np.zeros(0))
 
+    # Multi-section diagnostics (Phase: backlog item 27).
+    # Each entry: {x, from_section, to_section, A_up, A_dn, type, dP,
+    # dP_loss, dP_acc}. Empty for single-section pipes.
+    section_transitions: list[dict] = field(default_factory=list)
+
     def summary(self) -> str:
         """Return a formatted multi-line summary string (~70-80 chars wide).
 
@@ -206,11 +211,43 @@ class PipeResult:
         lines.append(sep)
         lines.append("")
 
+        sections = ps.get("sections", [])
+        n_sections = int(ps.get("n_sections", 1))
+        transitions = ps.get("section_transitions", [])
+
+        if n_sections > 1 and sections:
+            lines.append("SECTIONS")
+            for i, sec in enumerate(sections, start=1):
+                lines.append(
+                    f"  {i}: L = {sec['length']:7.2f} m, "
+                    f"ID = {sec['inner_diameter']*1000:6.1f} mm, "
+                    f"OD = {sec['outer_diameter']*1000:6.1f} mm, "
+                    f"ε = {sec['roughness']*1e6:4.0f} μm, "
+                    f"U = {sec['overall_U']:.2f} W/m²/K"
+                )
+            if transitions:
+                lines.append("")
+                lines.append("  Section transitions:")
+                for t in transitions:
+                    arrow_id = (
+                        f"{math.sqrt(4*t['A_up']/math.pi)*1000:.0f} mm → "
+                        f"{math.sqrt(4*t['A_dn']/math.pi)*1000:.0f} mm"
+                    )
+                    sign = "drop" if t["dP"] > 0 else "recovery"
+                    lines.append(
+                        f"    x = {t['x']:7.2f} m: {arrow_id} ({t['type']}), "
+                        f"ΔP = {t['dP']/1e5:+.3f} bar ({sign})"
+                    )
+            lines.append("")
+
         lines.append("PIPE")
-        lines.append(f"  Length:           {L:.2f} m")
-        lines.append(f"  Inner diameter:   {D_mm:.1f} mm  ({D_in:.1f}\")")
-        lines.append(f"  Roughness:        {eps*1e6:.0f} μm  (ε/D = {eps_D:.2e})")
-        lines.append(f"  Outer diameter:   {D_o_mm:.1f} mm")
+        if n_sections > 1:
+            lines.append(f"  Total length:     {L:.2f} m  ({n_sections} sections)")
+        else:
+            lines.append(f"  Length:           {L:.2f} m")
+            lines.append(f"  Inner diameter:   {D_mm:.1f} mm  ({D_in:.1f}\")")
+            lines.append(f"  Roughness:        {eps*1e6:.0f} μm  (ε/D = {eps_D:.2e})")
+            lines.append(f"  Outer diameter:   {D_o_mm:.1f} mm")
         if U_val > 0:
             lines.append(f"  Heat transfer:    U = {U_val:.1f} W/m²/K, T_amb = {T_amb_C:.1f} °C")
         else:

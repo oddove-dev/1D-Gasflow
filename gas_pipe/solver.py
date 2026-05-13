@@ -40,6 +40,7 @@ _G = 9.80665
 def _build_result(
     x_list: list[float],
     states: list,
+    A_list: list[float],
     Re_list: list[float],
     seg_info_list: list[dict],
     mdot: float,
@@ -51,6 +52,7 @@ def _build_result(
     opts: dict,
     elapsed: float,
     n_adaptive: int,
+    section_transitions: list[dict],
 ) -> "PipeResult":
     """Assemble PipeResult from accumulated per-segment data."""
     from .results import PipeResult
@@ -61,8 +63,11 @@ def _build_result(
     T_arr = np.array([s.T for s in states], dtype=float)
     rho_arr = np.array([s.rho for s in states], dtype=float)
     a_arr = np.array([s.a for s in states], dtype=float)
-    A = pipe.area
-    u_arr = mdot / (rho_arr * A)
+    # Per-station area is needed for multi-section pipes — at a section
+    # boundary the stored state is post-transition (downstream section),
+    # so we use the area that march_ivp tracked alongside each station.
+    A_arr = np.array(A_list, dtype=float)
+    u_arr = mdot / (rho_arr * A_arr)
     M_arr = u_arr / a_arr
     Z_arr = np.array([s.Z for s in states], dtype=float)
     h_arr = np.array([s.h for s in states], dtype=float)
@@ -101,6 +106,18 @@ def _build_result(
     U_val = pipe.U(0.0)
     T_amb_K = pipe.T_amb(0.0)
 
+    sections_summary = [
+        {
+            "length": s.length,
+            "inner_diameter": s.inner_diameter,
+            "outer_diameter": s.D_o(),
+            "roughness": s.roughness,
+            "overall_U": s.overall_U,
+            "elevation_change": s.elevation_change,
+        }
+        for s in pipe.sections
+    ]
+
     pipe_sum = {
         "length": pipe.length,
         "inner_diameter": D,
@@ -110,6 +127,9 @@ def _build_result(
         "ambient_temperature": T_amb_K,
         "n_fittings": len(pipe.fittings),
         "molar_mass": fluid.molar_mass,
+        "n_sections": len(pipe.sections),
+        "sections": sections_summary,
+        "section_transitions": list(section_transitions),
     }
 
     opts_full = dict(opts)
@@ -180,6 +200,7 @@ def _build_result(
         had_metastable=had_metastable,
         x_dewpoint_crossing=x_dewpoint_crossing,
         LVF=LVF_arr,
+        section_transitions=list(section_transitions),
     )
 
 
@@ -295,8 +316,10 @@ def march_ivp(
 
     x_list: list[float] = [0.0]
     states: list = [state0]
+    A_list: list[float] = [pipe.sections[0].area]
     Re_list: list[float] = []
     seg_info_list: list[dict] = []
+    section_transitions: list[dict] = []
 
     x = 0.0
     remaining = L
@@ -308,14 +331,27 @@ def march_ivp(
     result_choked = False
     x_choke_final: float | None = None
 
-    A = pipe.area
-    D = pipe.inner_diameter
-
     state_i = state0
 
     while remaining > min_dx:
         dx = min(dx_target, remaining)
         dx = max(dx, min_dx)
+
+        # Section-aware geometry at the current upstream station. For
+        # multi-section pipes A/D/eps_over_D can change abruptly at
+        # interior boundaries — we use the section that owns x (the
+        # boundary itself belongs to the upstream section per the
+        # section_at convention).
+        sec_i, _, _ = pipe.section_at(x)
+        A = sec_i.area
+        D = sec_i.inner_diameter
+
+        # Cap dx so the segment ends exactly at the next section
+        # boundary; the boundary transition is then applied at the
+        # clean segment end inside solve_segment.
+        boundary_x = pipe.next_section_boundary_after(x)
+        if boundary_x is not None and (boundary_x - x) > min_dx and (boundary_x - x) < dx:
+            dx = boundary_x - x
 
         state_prev = state_i
         u_i = mdot / (state_i.rho * A)
@@ -326,7 +362,7 @@ def march_ivp(
         if adaptive and M_i > 0.1:
             from .friction import darcy_friction as _df
             Re_i = state_i.rho * u_i * D / state_i.mu
-            f_i = _df(Re_i, pipe.eps_over_D, friction_model)
+            f_i = _df(Re_i, sec_i.eps_over_D, friction_model)
             M_pred = estimate_M_downstream(M_i, gamma_i, f_i, dx / D)
             while M_pred > mach_choke and dx > min_dx:
                 dx = max(dx * 0.5, min_dx)
@@ -381,11 +417,30 @@ def march_ivp(
 
         x_list.append(x_next)
         states.append(state_new)
+        A_out = info.get("A_out")
+        if A_out is None or not math.isfinite(A_out):
+            # Fall back to the section that owns x_next (upstream side at
+            # an interior boundary). Reached when bisect_for_choke returned
+            # without a normal solve_segment finalization.
+            sec_next, _, _ = pipe.section_at(x_next)
+            A_out = sec_next.area
+        A_list.append(float(A_out))
         Re_list.append(info.get("Re", 0.0))
         seg_info_list.append(info)
 
+        st = info.get("section_transition")
+        if st is not None:
+            section_transitions.append(st)
+
         state_i = state_new
         x = x_next
+        # If we just crossed a section boundary, nudge x past it so that
+        # subsequent section_at lookups return the downstream section.
+        # The nudge (10 nm) sits above the section_at boundary tolerance
+        # (1 nm) and is many orders of magnitude below any physical min_dx,
+        # so it's purely a lookup-side fix, not a physical step.
+        if st is not None:
+            x += 1e-8
         remaining = L - x
         seg_count += 1
 
@@ -469,10 +524,11 @@ def march_ivp(
     }
 
     return _build_result(
-        x_list, states, Re_list, seg_info_list,
+        x_list, states, A_list, Re_list, seg_info_list,
         mdot=mdot, choked=result_choked, x_choke=x_choke_final,
         fluid=fluid, pipe=pipe, bc=bc, opts=opts,
         elapsed=elapsed, n_adaptive=n_adaptive,
+        section_transitions=section_transitions,
     )
 
 

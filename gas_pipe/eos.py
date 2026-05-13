@@ -264,36 +264,48 @@ class GERGFluid:
                 ) from retry_exc
 
     def _eval_state_Ph(self, P: float, h: float) -> FluidState:
-        """Compute FluidState from (P, h). No caching."""
+        """Compute FluidState from (P, h). No caching.
+
+        The finally block unconditionally restores ``iphase_gas`` because
+        CoolProp's HSU_P_flash for HEOS mixtures raises before the in-line
+        ``specify_phase`` is reached; without restoration the shared
+        AbstractState stays in unspecified-phase mode and every subsequent
+        PT flash runs ~25× slower.
+        """
         s = self._state
         try:
             # Temporarily remove phase specification so the Ph flash solver
             # can search the full valid range without being forced to gas.
             s.unspecify_phase()
-            s.update(CoolProp.HmassP_INPUTS, h, P)
-            s.specify_phase(CoolProp.iphase_gas)
+            try:
+                s.update(CoolProp.HmassP_INPUTS, h, P)
 
-            T = s.T()
-            rho = s.rhomass()
-            entropy = s.smass()
-            cp = s.cpmass()
-            cv = s.cvmass()
-            mu = s.viscosity()
-            k = s.conductivity()
-            a = s.speed_sound()
-            R_spec = 8.31446 / s.molar_mass()
-            Z = P / (rho * R_spec * T)
-            mu_JT = s.first_partial_deriv(_iT, _iP, _iHmass)
+                T = s.T()
+                rho = s.rhomass()
+                entropy = s.smass()
+                cp = s.cpmass()
+                cv = s.cvmass()
+                mu = s.viscosity()
+                k = s.conductivity()
+                a = s.speed_sound()
+                R_spec = 8.31446 / s.molar_mass()
+                Z = P / (rho * R_spec * T)
+                mu_JT = s.first_partial_deriv(_iT, _iP, _iHmass)
 
-        except Exception as exc:
-            msg = str(exc).lower()
-            if any(w in msg for w in ("saturated", "two-phase", "two phase", "twophase")):
-                raise EOSTwoPhase(
-                    f"Two-phase condition at P={P/1e5:.3f} bara, h={h:.0f} J/kg"
+            except Exception as exc:
+                msg = str(exc).lower()
+                if any(w in msg for w in ("saturated", "two-phase", "two phase", "twophase")):
+                    raise EOSTwoPhase(
+                        f"Two-phase condition at P={P/1e5:.3f} bara, h={h:.0f} J/kg"
+                    ) from exc
+                raise EOSOutOfRange(
+                    f"EOS out of range at P={P/1e5:.3f} bara, h={h:.0f} J/kg: {exc}"
                 ) from exc
-            raise EOSOutOfRange(
-                f"EOS out of range at P={P/1e5:.3f} bara, h={h:.0f} J/kg: {exc}"
-            ) from exc
+        finally:
+            try:
+                s.specify_phase(CoolProp.iphase_gas)
+            except Exception:
+                pass
 
         return FluidState(
             P=P, T=T, rho=rho, h=h, s=entropy,
@@ -345,6 +357,24 @@ class GERGFluid:
         FluidState
         """
         return self._eval_state_Ph(P, h)
+
+    def props_Ph_via_jt(self, P_new: float, state_up: FluidState) -> FluidState:
+        """Isenthalpic flash via Joule-Thomson estimate then PT flash.
+
+        Robust alternative to :meth:`props_Ph` for HEOS mixtures, which
+        CoolProp cannot solve without a pre-built phase envelope. The JT
+        coefficient gives a first-order estimate of T at the new pressure
+        (accurate to order ΔP²), and the resulting (P_new, T_new) state
+        is then evaluated via the standard PT flash.
+        """
+        dP = P_new - state_up.P
+        T_new = state_up.T + state_up.mu_JT * dP
+        return self.props(P_new, T_new)
+
+    @property
+    def is_mixture(self) -> bool:
+        """True if the composition has more than one component."""
+        return len(self._composition) > 1
 
     def dew_temperature(self, P: float) -> float | None:
         """Return dew-point temperature at pressure P, or None if not computable.

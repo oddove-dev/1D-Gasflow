@@ -25,7 +25,7 @@ from .errors import (
     SolverCancelled,
 )
 from .eos import GERGFluid
-from .geometry import Pipe
+from .geometry import Pipe, PipeSection
 from .gui_widgets import CompositionEditor
 from .solver import march_ivp, solve_for_mdot
 
@@ -138,6 +138,24 @@ def _parse_positive_int(value: str, name: str) -> int:
     if n != f or n <= 0:
         raise _InputValidationError(f"{name} must be a positive integer; got {value!r}.")
     return n
+
+
+def _build_pipe(pipe_kwargs: dict) -> Pipe:
+    """Construct a Pipe from gather_inputs' pipe_kwargs (sections in SI)."""
+    sections = [
+        PipeSection(
+            length=s["length"],
+            inner_diameter=s["inner_diameter"],
+            outer_diameter=s["outer_diameter"],
+            roughness=s["roughness"],
+            overall_U=s["overall_U"],
+        )
+        for s in pipe_kwargs["sections_si"]
+    ]
+    return Pipe(
+        sections=sections,
+        ambient_temperature=pipe_kwargs["ambient_temperature"],
+    )
 
 
 # ----------------------------------------------------------------------
@@ -279,12 +297,15 @@ class MainWindow:
         self._validate_cmd = (self.root.register(_is_numeric_input), "%P")
 
         # ---- Tk variables ------------------------------------------------
-        # Geometry
-        self.var_length = tk.StringVar(value=str(_SKARV_GEOMETRY["length_m"]))
-        self.var_id_mm = tk.StringVar(value=str(_SKARV_GEOMETRY["inner_diameter_mm"]))
-        self.var_roughness_um = tk.StringVar(value=str(_SKARV_GEOMETRY["roughness_um"]))
-        self.var_od_mm = tk.StringVar(value=str(_SKARV_GEOMETRY["outer_diameter_mm"]))
-        self.var_U = tk.StringVar(value=str(_SKARV_GEOMETRY["overall_U"]))
+        # Geometry — list of section dicts (display units: m, mm, mm, μm, W/m²/K).
+        # The Skarv default is a single uniform section.
+        self._section_rows: list[dict[str, float]] = [{
+            "length_m": float(_SKARV_GEOMETRY["length_m"]),
+            "id_mm": float(_SKARV_GEOMETRY["inner_diameter_mm"]),
+            "od_mm": float(_SKARV_GEOMETRY["outer_diameter_mm"]),
+            "roughness_um": float(_SKARV_GEOMETRY["roughness_um"]),
+            "U": float(_SKARV_GEOMETRY["overall_U"]),
+        }]
         self.var_T_amb = tk.StringVar(value=str(_SKARV_GEOMETRY["ambient_T_C"]))
         # BC
         self.var_P_in = tk.StringVar(value=str(_SKARV_BC["P_in_bara"]))
@@ -423,16 +444,192 @@ class MainWindow:
         self._build_run_controls(outer).grid(row=4, column=0, sticky="ew", pady=(6, 0))
 
     def _build_geometry_section(self, parent: tk.Misc) -> ttk.LabelFrame:
-        f = ttk.LabelFrame(parent, text="Pipe geometry", padding=6)
-        f.columnconfigure(1, weight=1)
+        f = ttk.LabelFrame(parent, text="Pipe geometry sections", padding=6)
+        f.columnconfigure(0, weight=1)
         v = self._validate_cmd
-        _add_labeled_entry(f, 0, "Length [m]", self.var_length, v)
-        _add_labeled_entry(f, 1, "Inner diameter [mm]", self.var_id_mm, v)
-        _add_labeled_entry(f, 2, "Roughness [μm]", self.var_roughness_um, v)
-        _add_labeled_entry(f, 3, "Outer diameter [mm]", self.var_od_mm, v)
-        _add_labeled_entry(f, 4, "Overall U [W/m²/K]", self.var_U, v)
-        _add_labeled_entry(f, 5, "Ambient T [°C]", self.var_T_amb, v)
+
+        cols = ("idx", "length", "id", "od", "roughness", "U")
+        headings = {
+            "idx": "#",
+            "length": "L [m]",
+            "id": "ID [mm]",
+            "od": "OD [mm]",
+            "roughness": "ε [μm]",
+            "U": "U [W/m²/K]",
+        }
+        widths = {"idx": 28, "length": 70, "id": 70, "od": 70, "roughness": 60, "U": 80}
+
+        tv_frame = ttk.Frame(f)
+        tv_frame.grid(row=0, column=0, sticky="ew")
+        tv_frame.columnconfigure(0, weight=1)
+
+        tv = ttk.Treeview(tv_frame, columns=cols, show="headings", height=4)
+        for c in cols:
+            tv.heading(c, text=headings[c])
+            tv.column(c, width=widths[c], anchor="e", stretch=(c != "idx"))
+        tv.grid(row=0, column=0, sticky="ew")
+        sb = ttk.Scrollbar(tv_frame, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=sb.set)
+        sb.grid(row=0, column=1, sticky="ns")
+        tv.bind("<Double-1>", lambda _e: self._action_edit_section())
+        self._sections_tree = tv
+
+        # Button row.
+        btns = ttk.Frame(f)
+        btns.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(btns, text="+ Add section", command=self._action_add_section).pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Button(btns, text="Edit", command=self._action_edit_section).pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Button(btns, text="Remove", command=self._action_remove_section).pack(
+            side="left"
+        )
+
+        # Ambient T row.
+        amb_row = ttk.Frame(f)
+        amb_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        amb_row.columnconfigure(1, weight=1)
+        _add_labeled_entry(amb_row, 0, "Ambient T [°C]", self.var_T_amb, v)
+
+        self._refresh_sections_tree()
         return f
+
+    # ------------------------------------------------------------------
+    # Section editor actions
+    # ------------------------------------------------------------------
+    def _refresh_sections_tree(self) -> None:
+        """Re-render the sections Treeview from ``self._section_rows``."""
+        tv = self._sections_tree
+        for item in tv.get_children():
+            tv.delete(item)
+        for i, row in enumerate(self._section_rows, start=1):
+            tv.insert(
+                "", "end",
+                values=(
+                    str(i),
+                    f"{row['length_m']:.2f}",
+                    f"{row['id_mm']:.1f}",
+                    f"{row['od_mm']:.1f}",
+                    f"{row['roughness_um']:.1f}",
+                    f"{row['U']:.2f}",
+                ),
+            )
+
+    def _selected_section_index(self) -> int | None:
+        tv = self._sections_tree
+        sel = tv.selection()
+        if not sel:
+            return None
+        return tv.index(sel[0])
+
+    def _action_add_section(self) -> None:
+        """Append a new section, copying defaults from the last existing row."""
+        if self._section_rows:
+            new = dict(self._section_rows[-1])
+        else:
+            new = {
+                "length_m": 10.0, "id_mm": 200.0, "od_mm": 220.0,
+                "roughness_um": 45.0, "U": 0.0,
+            }
+        self._section_rows.append(new)
+        self._refresh_sections_tree()
+
+    def _action_remove_section(self) -> None:
+        """Remove the selected section. Refuses to remove the last one."""
+        idx = self._selected_section_index()
+        if idx is None:
+            messagebox.showinfo(
+                "Remove section",
+                "Select a row in the sections table first.",
+                parent=self.root,
+            )
+            return
+        if len(self._section_rows) <= 1:
+            messagebox.showwarning(
+                "Remove section",
+                "At least one section is required.",
+                parent=self.root,
+            )
+            return
+        del self._section_rows[idx]
+        self._refresh_sections_tree()
+
+    def _action_edit_section(self) -> None:
+        """Open a modal dialog to edit the selected section's fields."""
+        idx = self._selected_section_index()
+        if idx is None:
+            if not self._section_rows:
+                return
+            idx = 0
+        self._open_section_editor(idx)
+
+    def _open_section_editor(self, idx: int) -> None:
+        """Modal Toplevel editor for section row ``idx``."""
+        row = self._section_rows[idx]
+        win = tk.Toplevel(self.root)
+        win.title(f"Edit section {idx + 1}")
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+
+        v = self._validate_cmd
+        body = ttk.Frame(win, padding=10)
+        body.pack(fill="both", expand=True)
+
+        fields: dict[str, tk.StringVar] = {
+            "length_m": tk.StringVar(value=f"{row['length_m']:g}"),
+            "id_mm": tk.StringVar(value=f"{row['id_mm']:g}"),
+            "od_mm": tk.StringVar(value=f"{row['od_mm']:g}"),
+            "roughness_um": tk.StringVar(value=f"{row['roughness_um']:g}"),
+            "U": tk.StringVar(value=f"{row['U']:g}"),
+        }
+        labels = [
+            ("Length [m]", "length_m"),
+            ("Inner diameter [mm]", "id_mm"),
+            ("Outer diameter [mm]", "od_mm"),
+            ("Roughness [μm]", "roughness_um"),
+            ("Overall U [W/m²/K]", "U"),
+        ]
+        for r, (label, key) in enumerate(labels):
+            _add_labeled_entry(body, r, label, fields[key], v)
+
+        btn_row = ttk.Frame(body)
+        btn_row.grid(row=len(labels), column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        btn_row.columnconfigure(0, weight=1)
+
+        def _on_ok() -> None:
+            try:
+                new = {
+                    "length_m": _parse_positive_float(fields["length_m"].get(), "Length"),
+                    "id_mm": _parse_positive_float(fields["id_mm"].get(), "Inner diameter"),
+                    "od_mm": _parse_positive_float(fields["od_mm"].get(), "Outer diameter"),
+                    "roughness_um": _parse_positive_float(
+                        fields["roughness_um"].get(), "Roughness"
+                    ),
+                    "U": _parse_nonneg_float(fields["U"].get(), "Overall U"),
+                }
+            except _InputValidationError as exc:
+                messagebox.showerror("Invalid input", str(exc), parent=win)
+                return
+            if new["od_mm"] < new["id_mm"]:
+                messagebox.showerror(
+                    "Invalid input",
+                    f"Outer diameter ({new['od_mm']:.1f} mm) must be ≥ inner "
+                    f"diameter ({new['id_mm']:.1f} mm).",
+                    parent=win,
+                )
+                return
+            self._section_rows[idx] = new
+            self._refresh_sections_tree()
+            win.destroy()
+
+        ttk.Button(btn_row, text="Cancel", command=win.destroy).pack(side="right")
+        ttk.Button(btn_row, text="OK", command=_on_ok).pack(side="right", padx=(0, 6))
+
+        win.bind("<Return>", lambda _e: _on_ok())
+        win.bind("<Escape>", lambda _e: win.destroy())
 
     def _build_bc_section(self, parent: tk.Misc) -> ttk.LabelFrame:
         f = ttk.LabelFrame(parent, text="Boundary conditions", padding=6)
@@ -809,27 +1006,40 @@ class MainWindow:
                 f"(Σ = {total:.6f}). Use the Normalize button or fix the rows."
             )
 
-        # Geometry — convert to SI on read
-        length = _parse_positive_float(self.var_length.get(), "Length")
-        id_m = _parse_positive_float(self.var_id_mm.get(), "Inner diameter") * 1e-3
-        roughness_m = (
-            _parse_positive_float(self.var_roughness_um.get(), "Roughness") * 1e-6
-        )
-        od_m = _parse_positive_float(self.var_od_mm.get(), "Outer diameter") * 1e-3
-        if od_m < id_m:
-            raise _InputValidationError(
-                f"Outer diameter ({od_m * 1e3:.1f} mm) must be ≥ inner diameter "
-                f"({id_m * 1e3:.1f} mm)."
-            )
-        overall_U = _parse_nonneg_float(self.var_U.get(), "Overall U")
+        # Geometry — sections list, converted to SI.
+        if not self._section_rows:
+            raise _InputValidationError("At least one pipe section is required.")
+        sections_si: list[dict[str, float]] = []
+        for i, row in enumerate(self._section_rows, start=1):
+            length = float(row["length_m"])
+            id_m = float(row["id_mm"]) * 1e-3
+            od_m = float(row["od_mm"]) * 1e-3
+            roughness_m = float(row["roughness_um"]) * 1e-6
+            U = float(row["U"])
+            if length <= 0 or id_m <= 0 or od_m <= 0 or roughness_m <= 0:
+                raise _InputValidationError(
+                    f"Section {i}: all dimensions must be positive."
+                )
+            if od_m < id_m:
+                raise _InputValidationError(
+                    f"Section {i}: outer diameter ({od_m * 1e3:.1f} mm) must "
+                    f"be ≥ inner diameter ({id_m * 1e3:.1f} mm)."
+                )
+            if U < 0:
+                raise _InputValidationError(
+                    f"Section {i}: overall U must be ≥ 0."
+                )
+            sections_si.append({
+                "length": length,
+                "inner_diameter": id_m,
+                "outer_diameter": od_m,
+                "roughness": roughness_m,
+                "overall_U": U,
+            })
         T_amb_K = _parse_float(self.var_T_amb.get(), "Ambient T") + 273.15
 
         pipe_kwargs = {
-            "length": length,
-            "inner_diameter": id_m,
-            "roughness": roughness_m,
-            "outer_diameter": od_m,
-            "overall_U": overall_U,
+            "sections_si": sections_si,
             "ambient_temperature": T_amb_K,
         }
 
@@ -929,7 +1139,7 @@ class MainWindow:
         # Build solver inputs on the Tk thread (cheap, validates EOS too).
         try:
             fluid = GERGFluid(inputs["composition"])
-            pipe = Pipe.horizontal_uniform(**inputs["pipe_kwargs"])
+            pipe = _build_pipe(inputs["pipe_kwargs"])
         except EOSOutOfRange as exc:
             self._show_solver_error(
                 "EOS out of range",
@@ -1136,7 +1346,7 @@ class MainWindow:
 
         try:
             fluid = GERGFluid(inputs["composition"])
-            pipe = Pipe.horizontal_uniform(**inputs["pipe_kwargs"])
+            pipe = _build_pipe(inputs["pipe_kwargs"])
         except EOSOutOfRange as exc:
             self._show_solver_error("EOS out of range", str(exc), exc)
             return
