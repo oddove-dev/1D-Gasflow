@@ -12,6 +12,45 @@ if TYPE_CHECKING:
     pass
 
 
+def _format_discretization_line(opts: dict, n_segs: int) -> str:
+    """Format the 'Discretization:' line for the NUMERICAL summary block.
+
+    Reads the ``discretization`` sub-dict stamped on
+    ``solver_options`` by the GUI (item 2 follow-up). Falls back to the
+    pre-stamp format when the key is absent — keeps backward
+    compatibility for results produced by direct API calls or older
+    persistence formats.
+    """
+    discr = opts.get("discretization")
+    n_adaptive = int(opts.get("n_adaptive_refinements", 0))
+    if discr is None:
+        return f"Segments:         {n_segs} ({n_adaptive} adaptive refinements near choke)"
+
+    mode = discr.get("mode")
+    if mode == "adaptive":
+        initial = int(discr.get("initial_n_segments", n_segs))
+        return (
+            f"Discretization:   Adaptive (initial {initial} segs, "
+            f"refined to {n_segs}, {n_adaptive} refinement events)"
+        )
+    if mode == "linear":
+        n_lin = int(discr.get("n_segments", n_segs))
+        dx_m = float(discr.get("dx_m", 0.0))
+        return (
+            f"Discretization:   Linear, {n_lin} segments, dx = {dx_m:.2f} m"
+        )
+    if mode == "dimensionless":
+        alpha = float(discr.get("alpha", float("nan")))
+        dx_m = float(discr.get("dx_m", 0.0))
+        n_dim = int(discr.get("n_segments", n_segs))
+        return (
+            f"Discretization:   Dimensionless, α={alpha:g}, "
+            f"dx = {dx_m:.2f} m, {n_dim} segments"
+        )
+    # Unknown mode — fall back to the historical line.
+    return f"Segments:         {n_segs} ({n_adaptive} adaptive refinements near choke)"
+
+
 @dataclass
 class PipeResult:
     """Complete result of a 1D gas pipe flow simulation.
@@ -396,7 +435,7 @@ class PipeResult:
                 lines.append("")
 
         lines.append("NUMERICAL")
-        lines.append(f"  Segments:         {n_segs} ({n_adaptive} adaptive refinements near choke)")
+        lines.append(f"  {_format_discretization_line(opts, n_segs)}")
         lines.append(f"  Avg iter/seg:     {avg_iter:.1f}")
         lines.append(f"  Energy residual:  {self.energy_residual:.2e}  (relative)")
         lines.append(f"  Min Δx:           {self.min_dx*1000:.1f} mm")

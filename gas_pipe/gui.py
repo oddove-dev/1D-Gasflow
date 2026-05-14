@@ -28,7 +28,13 @@ from .errors import (
 from .eos import GERGFluid, TabulatedFluid, estimate_operating_window
 from .geometry import Pipe, PipeSection
 from .gui_widgets import CompositionEditor
-from .solver import march_ivp, solve_for_mdot, verify_eos_accuracy
+from .solver import (
+    DX_INITIAL_PER_DIAMETER,
+    initial_n_segments,
+    march_ivp,
+    solve_for_mdot,
+    verify_eos_accuracy,
+)
 
 if TYPE_CHECKING:
     from .eos import FluidEOSBase
@@ -181,8 +187,13 @@ _SKARV_BC = {
 }
 
 _SKARV_SOLVER = {
-    "n_segments": 200,
+    # Discretization is now driven by the Adaptive toggle:
+    # - Adaptive ON  → solver uses initial_n_segments(L, D) internally
+    # - Adaptive OFF → user picks Linear (N) or Dimensionless (α)
     "adaptive": True,
+    "discretization_mode": "dimensionless",  # used only when adaptive OFF
+    "linear_n_segments": 100,
+    "dimensionless_alpha": float(DX_INITIAL_PER_DIAMETER),
     "friction_model": "blended",
     "mach_warning": 0.7,
     "mach_choke": 0.99,
@@ -329,8 +340,18 @@ class MainWindow:
         self.var_mdot = tk.StringVar(value=str(_SKARV_BC["mdot_kgs"]))
         self.var_P_out = tk.StringVar(value=str(_SKARV_BC["P_out_bara"]))
         # Solver
-        self.var_n_seg = tk.StringVar(value=str(_SKARV_SOLVER["n_segments"]))
+        # Discretization: split into adaptive + (linear N or dimensionless α).
+        # Only one of n_seg / alpha is meaningful at a time, but we hold both
+        # so the user can flip between Linear and Dimensionless without
+        # losing the previously entered value.
         self.var_adaptive = tk.BooleanVar(value=bool(_SKARV_SOLVER["adaptive"]))
+        self.var_discretization_mode = tk.StringVar(
+            value=str(_SKARV_SOLVER["discretization_mode"])
+        )
+        self.var_n_seg = tk.StringVar(value=str(_SKARV_SOLVER["linear_n_segments"]))
+        self.var_alpha = tk.StringVar(
+            value=f"{_SKARV_SOLVER['dimensionless_alpha']:g}"
+        )
         self.var_friction = tk.StringVar(value=str(_SKARV_SOLVER["friction_model"]))
         self.var_mach_warn = tk.StringVar(value=str(_SKARV_SOLVER["mach_warning"]))
         self.var_mach_choke = tk.StringVar(value=str(_SKARV_SOLVER["mach_choke"]))
@@ -711,10 +732,55 @@ class MainWindow:
         self._solver_inner = f
         v = self._validate_cmd
 
-        _add_labeled_entry(f, 0, "Number of segments", self.var_n_seg, v)
+        # Discretization: adaptive toggle + (linear N | dimensionless α).
+        # The two non-adaptive entries share a slot below the radio buttons
+        # so the panel doesn't change height when the user flips modes.
         ttk.Checkbutton(
-            f, text="Adaptive Δx", variable=self.var_adaptive
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=2)
+            f, text="Adaptive refinement (recommended)",
+            variable=self.var_adaptive,
+            command=self._on_adaptive_toggled,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
+
+        # Sub-frame visible only when adaptive is off.
+        self._discr_frame = ttk.Frame(f)
+        self._discr_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(16, 0))
+        self._discr_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(self._discr_frame, text="Discretization:").grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+
+        # Linear: ( ) Linear   N = [   ]   (dx = L/N, uniform)
+        lin_row = ttk.Frame(self._discr_frame)
+        lin_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=1)
+        ttk.Radiobutton(
+            lin_row, text="Linear", variable=self.var_discretization_mode,
+            value="linear", command=self._on_discr_mode_changed,
+        ).pack(side="left")
+        ttk.Label(lin_row, text="  N =").pack(side="left", padx=(8, 4))
+        self._lin_entry = ttk.Entry(
+            lin_row, textvariable=self.var_n_seg, width=6, justify="right",
+            validate="key", validatecommand=v,
+        )
+        self._lin_entry.pack(side="left")
+        ttk.Label(lin_row, text="  (dx = L/N, uniform)",
+                  foreground="#555555").pack(side="left", padx=(8, 0))
+
+        # Dimensionless: ( ) Dimensionless   α = [   ]   (dx = α·D)
+        dim_row = ttk.Frame(self._discr_frame)
+        dim_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=1)
+        ttk.Radiobutton(
+            dim_row, text="Dimensionless", variable=self.var_discretization_mode,
+            value="dimensionless", command=self._on_discr_mode_changed,
+        ).pack(side="left")
+        ttk.Label(dim_row, text="  α =").pack(side="left", padx=(8, 4))
+        self._dim_entry = ttk.Entry(
+            dim_row, textvariable=self.var_alpha, width=6, justify="right",
+            validate="key", validatecommand=v,
+        )
+        self._dim_entry.pack(side="left")
+        ttk.Label(dim_row, text="  (dx = α·D, scaled with diameter)",
+                  foreground="#555555").pack(side="left", padx=(8, 0))
 
         ttk.Label(f, text="Friction model").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=2)
         ttk.Combobox(
@@ -727,7 +793,24 @@ class MainWindow:
         _add_labeled_entry(f, 5, "Min Δx [mm]", self.var_min_dx_mm, v)
 
         f.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+
+        # Initial visibility / enable state.
+        self._on_adaptive_toggled()
         return outer
+
+    def _on_adaptive_toggled(self) -> None:
+        """Hide the discretization sub-panel when adaptive is on."""
+        if self.var_adaptive.get():
+            self._discr_frame.grid_remove()
+        else:
+            self._discr_frame.grid()
+            self._on_discr_mode_changed()
+
+    def _on_discr_mode_changed(self) -> None:
+        """Enable only the entry corresponding to the selected mode."""
+        is_linear = self.var_discretization_mode.get() == "linear"
+        self._lin_entry.configure(state="normal" if is_linear else "disabled")
+        self._dim_entry.configure(state="disabled" if is_linear else "normal")
 
     def _build_eos_section(self, parent: tk.Misc) -> ttk.LabelFrame:
         """EOS-evaluation panel: tabulated vs direct, grid size, window override."""
@@ -1208,9 +1291,53 @@ class MainWindow:
             "P_out": P_out,
         }
 
-        # Solver options
-        n_seg = _parse_positive_int(self.var_n_seg.get(), "Number of segments")
+        # Solver options — resolve discretization first since N depends on
+        # the chosen mode.
         adaptive = bool(self.var_adaptive.get())
+
+        # Pipe length and reference diameter (first section) for the
+        # adaptive / dimensionless initial-N calculation.
+        L_pipe = sum(s["length"] for s in pipe_kwargs["sections_si"])
+        D_ref = float(pipe_kwargs["sections_si"][0]["inner_diameter"])
+
+        discretization: dict[str, Any]
+        if adaptive:
+            n_seg = initial_n_segments(L_pipe, D_ref)
+            discretization = {
+                "mode": "adaptive",
+                "initial_n_segments": n_seg,
+            }
+        else:
+            mode = self.var_discretization_mode.get().strip()
+            if mode == "linear":
+                n_seg = _parse_positive_int(self.var_n_seg.get(), "Linear N")
+                if n_seg < 2:
+                    raise _InputValidationError("Linear N must be ≥ 2.")
+                discretization = {
+                    "mode": "linear",
+                    "n_segments": n_seg,
+                    "dx_m": L_pipe / n_seg,
+                }
+            elif mode == "dimensionless":
+                alpha = _parse_positive_float(self.var_alpha.get(), "Dimensionless α")
+                dx = alpha * D_ref
+                if dx >= L_pipe:
+                    raise _InputValidationError(
+                        f"α={alpha:g} gives dx={dx:.2f} m ≥ pipe length "
+                        f"{L_pipe:.2f} m; choose a smaller α."
+                    )
+                n_seg = max(2, round(L_pipe / dx))
+                discretization = {
+                    "mode": "dimensionless",
+                    "alpha": alpha,
+                    "dx_m": dx,
+                    "n_segments": n_seg,
+                }
+            else:
+                raise _InputValidationError(
+                    f"Unknown discretization mode {mode!r}."
+                )
+
         friction_model = self.var_friction.get().strip()
         if friction_model not in _FRICTION_MODELS:
             raise _InputValidationError(
@@ -1274,6 +1401,7 @@ class MainWindow:
             "bc": bc,
             "solver_kwargs": solver_kwargs,
             "eos_kwargs": eos_kwargs,
+            "discretization": discretization,
         }
 
     # ------------------------------------------------------------------
@@ -1328,6 +1456,7 @@ class MainWindow:
         bc = inputs["bc"]
         solver_kwargs = inputs["solver_kwargs"]
         eos_kwargs = inputs["eos_kwargs"]
+        discretization = inputs["discretization"]
 
         # IVP doesn't take eos_mode (march_ivp's signature); if the user
         # picked table mode and IVP, wrap the fluid up-front so the march
@@ -1349,21 +1478,42 @@ class MainWindow:
                 eos_kwargs.get("table_n_T", 50),
             )
 
+        def _stamp_discretization(r: "PipeResult") -> "PipeResult":
+            # Stamp the discretization choice onto the result so the
+            # summary can render the correct mode line. We do this at
+            # the GUI level (rather than passing discretization through
+            # march_ivp) so the solver core stays oblivious to GUI-side
+            # UX decisions.
+            r.solver_options["discretization"] = dict(discretization)
+            r.solver_options["pipe_inner_diameter"] = float(
+                pipe.sections[0].inner_diameter
+            )
+            return r
+
         # Define the work the worker thread will do. Closes over `bc`,
         # `solver_kwargs`, `fluid`, `pipe`, and the worker's cancel_event.
+        # BVPChoked carries a result on the exception object — we stamp
+        # it before re-raising so the choked summary still shows the
+        # discretization line.
         def _do_solve() -> "PipeResult":
             cancel_event = self._worker.cancel_event
-            if bc["mode"] == "IVP":
-                wrapped = _wrap_fluid_for_ivp()
-                return march_ivp(
-                    pipe, wrapped, bc["P_in"], bc["T_in"], bc["mdot"],
-                    cancel_event=cancel_event, **solver_kwargs,
-                )
-            return solve_for_mdot(
-                pipe, fluid, bc["P_in"], bc["T_in"], bc["P_out"],
-                cancel_event=cancel_event,
-                **eos_kwargs, **solver_kwargs,
-            )
+            try:
+                if bc["mode"] == "IVP":
+                    wrapped = _wrap_fluid_for_ivp()
+                    r = march_ivp(
+                        pipe, wrapped, bc["P_in"], bc["T_in"], bc["mdot"],
+                        cancel_event=cancel_event, **solver_kwargs,
+                    )
+                else:
+                    r = solve_for_mdot(
+                        pipe, fluid, bc["P_in"], bc["T_in"], bc["P_out"],
+                        cancel_event=cancel_event,
+                        **eos_kwargs, **solver_kwargs,
+                    )
+            except BVPChoked as exc:
+                _stamp_discretization(exc.result)
+                raise
+            return _stamp_discretization(r)
 
         # ---- UI: enter "running" state ----------------------------------
         self._current_run_kind = "analysis"
@@ -1719,6 +1869,8 @@ class MainWindow:
         bc = inputs["bc"]
         solver_kwargs = inputs["solver_kwargs"]
         eos_kwargs = inputs["eos_kwargs"]
+        discretization = inputs["discretization"]
+        D_ref = float(pipe.sections[0].inner_diameter)
 
         # P_out schedule: 8 points log-spaced from 0.9·P_in to 0.05·P_in.
         # Order high → low so a true choke plateau appears as a flat tail
@@ -1734,6 +1886,13 @@ class MainWindow:
         self._sweep_total = len(P_out_array)
 
         def _on_point(idx_completed: int, total: int, point: dict) -> None:
+            # Stamp the discretization choice on each per-point PipeResult
+            # the same way the BVP run does, so summaries opened from
+            # sweep points show the correct mode line.
+            r = point.get("result")
+            if r is not None:
+                r.solver_options["discretization"] = dict(discretization)
+                r.solver_options["pipe_inner_diameter"] = D_ref
             self._sweep_partial.append(point)
 
         def _do_sweep() -> list[dict]:

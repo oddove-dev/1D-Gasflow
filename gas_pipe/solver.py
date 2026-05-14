@@ -40,6 +40,35 @@ logger = logging.getLogger(__name__)
 
 _G = 9.80665
 
+# Adaptive-mode discretization constants.
+#
+# DX_INITIAL_PER_DIAMETER sets the initial segment length as a multiple of
+# inner diameter — choosing dx_initial = D gives ~25 segments per Fanno
+# length (D/f at typical f ≈ 0.04) which is the empirical sweet spot for
+# adaptive refinement: enough resolution to detect the choke band, few
+# enough segments that we don't burn time before adaptive refinement has
+# anything to do.
+DX_INITIAL_PER_DIAMETER = 1.0
+INITIAL_N_SEG_MIN = 10
+INITIAL_N_SEG_MAX = 500
+
+
+def initial_n_segments(L: float, D: float) -> int:
+    """Initial segment count for adaptive refinement start.
+
+    Scales with pipe diameter (L/D similarity) so initial dimensionless
+    resolution is independent of pipe size. Empirically verified that
+    dx = D gives comfortable adaptive convergence with minimal
+    refinement events for typical compressible pipe flow problems.
+
+    Bounds: 10 (minimum for adaptive to function) to 500 (cap for very
+    long pipes).
+    """
+    return max(
+        INITIAL_N_SEG_MIN,
+        min(INITIAL_N_SEG_MAX, round(L / (DX_INITIAL_PER_DIAMETER * D))),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Helpers

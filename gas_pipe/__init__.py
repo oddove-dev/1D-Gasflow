@@ -30,7 +30,13 @@ from .errors import (
 from .fittings import Fitting
 from .geometry import Pipe, PipeSection
 from .results import PipeResult
-from .solver import march_ivp, plateau_sweep, solve_for_mdot, verify_eos_accuracy
+from .solver import (
+    initial_n_segments,
+    march_ivp,
+    plateau_sweep,
+    solve_for_mdot,
+    verify_eos_accuracy,
+)
 
 __all__ = [
     "GERGFluid",
@@ -47,6 +53,7 @@ __all__ = [
     "solve_for_mdot",
     "plateau_sweep",
     "verify_eos_accuracy",
+    "initial_n_segments",
     "GasPipeError",
     "EOSOutOfRange",
     "EOSTwoPhase",
