@@ -15,19 +15,95 @@ initialization via L/D similarity.
 
 ## Planned
 
+### Inline device model and HEM source — AIV groundwork
+
+This sequence implements an inline device model for pressure-reducing
+elements (PSV, orifice plate, choke valve, RO) placed between two pipe
+sections. Produces upstream/downstream pipe states via HEM throat solution
+and Borda-Carnot transition. Replaces the previous "Upstream sources" item
+and lays groundwork for EI AVIFF T2.7 acoustic source PWL.
+
+Architectural principles locked in design phase:
+
+- Device is a node between two pipe sections; "no upstream pipe" (PSV on
+  a tank with u_upstream≈0) is a special case handled by a convenience
+  constructor on the same general model.
+- HEM as single source model for all phases (gas, near-dew, two-phase);
+  no frozen-flow alternative, no method selection.
+- η_dissipation in the vena-contracta → pipe-inlet transition is a
+  *computed result* from mass/energy/momentum conservation + GERG EOS,
+  not a tunable parameter. Borda-Carnot momentum balance always on;
+  η falls out as η = 1 − (u_inlet/u_vc)². Bounds: η → 1 for sharp
+  expansion (A_vc ≪ A_pipe, typical PSV), η → 0 for marginal expansion.
+- mdot is a system-level quantity, not a per-device input. Devices
+  always use geometry-driven mode internally (A_geom, Cd from user).
+  System BVP supports three modes: (P_in, P_out) → mdot; (P_in, mdot)
+  → P_out; (P_out, mdot) → P_in. Specify exactly two of three.
+- EI AVIFF T2.7.3 is the sole source PWL method. SFF=6 derived from
+  ThroatState.choked flag. No alternative source models (Lighthill,
+  acceleration-loss formulations explicitly excluded).
+- Propagation via piecewise 60·L/D attenuation; logarithmic summation
+  for multiple sources in the same line. TMM-style propagation
+  explicitly out of scope (AIFF concern; AIV in gas_flow is screening).
+
+Sequence (remaining; Item numbers assigned at implementation start):
+
+- **Inline device model + multi-element BVP**: `Device` element taking
+  upstream pipe state, geometry (A_geom, Cd), downstream pipe geometry.
+  Internally: compute stagnation from upstream pipe state
+  (h_stag = h_static + u²/2), call HEM throat (always mode A
+  geometry-driven), Borda-Carnot momentum balance to downstream pipe
+  inlet. Returns `DeviceResult` with (ThroatState, TransitionResult,
+  η_dissipation, dh_static, ds). Convenience constructor
+  `Device.from_stagnation` for u_upstream=0 case (PSV on tank).
+
+  Simultaneously: `solve_chain(chain, fluid, *, P_in=None, P_out=None,
+  mdot=None)` with three-mode dispatch:
+    - P_in + P_out → solve for mdot (Newton on mdot, existing
+      BVP pattern extended to chain)
+    - P_in + mdot → solve for P_out (forward march)
+    - P_out + mdot → solve for P_in (backward march)
+  Validates exactly two of three given; raises clear error otherwise.
+  Devices always use geometry-driven mode internally. Choked validation
+  runtime during march; raise `OverChokedError` with diagnostic info
+  (device location, max possible mdot) on conflict. Plain pipe is a
+  chain of length 1; existing `solve_for_mdot` becomes thin wrapper
+  around `solve_chain`.
+  Tests: all three modes converge to same point on round-trip,
+  Borda-Carnot grenseverdier (A_vc/A_pipe → 0 gives η → 1;
+  A_vc/A_pipe → 1 gives η → 0), choked-conflict diagnostics fire
+  correctly, single-pipe regression vs existing `solve_for_mdot`.
+  Estimate: ~3–4 days.
+
+- **Acoustic source PWL (EI AVIFF T2.7.3)**: Apply Carucci-Mueller
+  formula at each device node and auto-detected section-boundary
+  contractions where M_downstream ≥ 0.999·mach_choke. Inputs from
+  upstream stagnation (computed by device model). SFF=6 from
+  ThroatState.choked, 0 otherwise. Output:
+  `ChainResult.acoustic_sources: list[SourceLocation]` with
+  (x, PWL_dB, sonic_flag, source_kind). Fanno-asymptote mid-pipe
+  choking NOT classified as AVIFF source (outside T2.7 calibration
+  basis); raise `AcousticSourceWarning` if encountered with optional
+  override flag.
+  Tests: reproduce EI AVIFF Appendix D worked examples within
+  tolerance.
+  Estimate: ~1 day.
+
+- **Acoustic propagation profile**: PWL(x) along chain via piecewise
+  60·L/D attenuation through multi-section (D_int switches at section
+  boundaries and across devices; attenuation accumulates as running
+  sum). Logarithmic summation when multiple upstream sources contribute
+  to a given point. Output: `ChainResult.acoustic_profile` as
+  ndarray over segment centers, with per-segment contribution breakdown
+  for diagnostics. 155 dB screening threshold flagged in output.
+  Estimate: ~1 day.
+
+### Other planned items (unchanged)
+
 - **Network topology**: T-junctions and parallel branches. Outer iteration
   on junction pressures, inner per-pipe solver. Architecture described in
-  CLAUDE.md Roadmap section.
-
-- **Acoustic source strength**: Compute local and total acoustic power from
-  solved flow profile, particularly through choke asymptote. Output as
-  input to AIFF TMM analysis. Method selection at implementation time.
-
-- **Upstream sources (PSV, orifice)**: Isentropic expansion to throat with
-  full energy balance (kinetic term included), then geometry-dependent
-  kinetic energy recovery to pipe inlet. Boundary condition wrapper around
-  pipe solver. Critical for downstream material temperature in cryogenic
-  depressurization scenarios.
+  CLAUDE.md Roadmap section. Will extend chain-mode to per-branch mdot,
+  and acoustic propagation to junction-summation logic.
 
 - **Outlet expansion analysis**: 1D diagnostics for choked outlets where
   pipe-end P >> ambient — Mach disk position, fully expanded jet state,
@@ -59,6 +135,12 @@ initialization via L/D similarity.
   similar). Extension of acoustic source strength once basic implementation
   is in place.
 
+- **Diffuser geometry extension for transition**: ESDU-style empirical
+  recovery efficiency for conical diffusers (half-angle, L/D inputs).
+  Default Borda-Carnot covers sharp expansion correctly (PSV outlets,
+  sudden area change); add only if non-sharp diffuser geometries appear
+  in scope.
+
 - **Chord method retry monitoring**: Stage 1 perf work introduced chord
   Newton (single Jacobian per segment) with FD-Jacobian fallback. Currently
   ~2 of 200 Skarv segments need the retry; not a problem at present. If
@@ -66,6 +148,12 @@ initialization via L/D similarity.
 
 ## Done
 
+- **2026-05-14**: Item 3 — HEM throat solver core (`GERGFluid.hem_throat`,
+  `props_Ps_via_jt`). Bounded-Brent G_max maximization on the (P_t, s_stag)
+  isentrope; `ThroatState` with all fields populated for both `A_vc` and
+  `mdot` input modes; `HEMConsistencyError`/`Warning` post-convergence
+  sanity band. First item of the AIV / HEM-source sequence. Three commits:
+  scaffolding (`6c690eb`), implementation (`5c66358`), tests (this commit).
 - **2026-05-14**: Adaptive grid initialization via L/D similarity
   (dx_initial = D, α=1.0). Replaces hardcoded n_segments default.
 - **2026-05-14**: GUI restructure — hide n_segments under Adaptive on;
