@@ -8,6 +8,8 @@ Public API:
 """
 from __future__ import annotations
 
+from .chain import ChainElement, ChainResult, ChainSpec, solve_chain
+from .device import Device, DeviceResult, TransitionResult
 from .eos import (
     ALLOWED_COMPONENTS,
     FluidEOSBase,
@@ -27,6 +29,7 @@ from .errors import (
     HEMConsistencyError,
     HEMConsistencyWarning,
     IntegrationCapExceeded,
+    OverChokedError,
     SegmentConvergenceError,
     SolverCancelled,
 )
@@ -53,6 +56,13 @@ __all__ = [
     "PipeSection",
     "Fitting",
     "PipeResult",
+    "Device",
+    "DeviceResult",
+    "TransitionResult",
+    "ChainSpec",
+    "ChainResult",
+    "ChainElement",
+    "solve_chain",
     "march_ivp",
     "solve_for_mdot",
     "plateau_sweep",
@@ -67,6 +77,7 @@ __all__ = [
     "BVPNotBracketedError",
     "HEMConsistencyError",
     "HEMConsistencyWarning",
+    "OverChokedError",
     "IntegrationCapExceeded",
     "SolverCancelled",
 ]

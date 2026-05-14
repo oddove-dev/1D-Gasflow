@@ -79,3 +79,37 @@ class HEMConsistencyWarning(UserWarning):
     warnings.warn requires a Warning ancestry.
     """
     pass
+
+
+class OverChokedError(GasPipeError):
+    """Raised by Device.solve when mdot exceeds A_vc · G_max at (P_stag, T_stag).
+
+    Indicates the device cannot pass the requested mass flow at the
+    current stagnation conditions and effective area. Diagnostic fields
+    let the chain solver map the failure to a Mode 1 ``BVPChoked`` (with
+    ``mdot_critical = max_mdot``) or surface a Mode 3 infeasibility
+    message identifying the bracket exhaustion.
+
+    ``device_index`` defaults to ``None`` — ``Device.solve`` does not know
+    its own position in a chain. The chain march fills it in when
+    re-raising.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        device_index: int | None = None,
+        device_name: str = "",
+        max_mdot: float,
+        attempted_mdot: float,
+        P_stag: float,
+        T_stag: float,
+    ) -> None:
+        super().__init__(message)
+        self.device_index = device_index
+        self.device_name = device_name
+        self.max_mdot = max_mdot
+        self.attempted_mdot = attempted_mdot
+        self.P_stag = P_stag
+        self.T_stag = T_stag
