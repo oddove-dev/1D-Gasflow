@@ -6,6 +6,7 @@ Nothing else imports CoolProp directly.
 from __future__ import annotations
 
 import logging
+import math
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
@@ -15,8 +16,14 @@ import CoolProp
 import CoolProp.CoolProp as CP
 import numpy as np
 from CoolProp.CoolProp import AbstractState
+from scipy.optimize import minimize_scalar
 
-from .errors import EOSOutOfRange, EOSTwoPhase
+from .errors import (
+    EOSOutOfRange,
+    EOSTwoPhase,
+    HEMConsistencyError,
+    HEMConsistencyWarning,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -483,13 +490,28 @@ class GERGFluid:
     def props_Ps_via_jt(self, P_new: float, state_up: FluidState) -> FluidState:
         """Isentropic flash via ideal-gas estimate then Newton correction on s.
 
-        Robust alternative to a direct HEOS Ps-flash for mixtures. Uses
-        the ideal-gas isentropic relation ``T·P^((1-γ)/γ) = const`` for the
-        first guess (with ``γ = cp/cv`` from ``state_up``), then PT-flashes
-        and applies Newton steps ``ΔT = -(s_new - s_up)·T_new/cp_new`` until
-        the entropy residual is below tolerance.
+        Robust alternative to a direct HEOS Ps-flash for mixtures, which
+        share the Ph-flash dysfunction class. The ideal-gas isentropic
+        relation ``T·P^((1-γ)/γ) = const`` with ``γ = cp/cv`` from
+        ``state_up`` gives a first guess; subsequent PT flashes plus
+        Newton steps ``ΔT = -(s_new - s_target)·T/cp_latest`` (cp taken
+        from the latest flash, not stagnation, for better accuracy near
+        choke) drive the entropy residual to
+        ``|Δs|/max(|s_target|, 1) < 1e-7``. Capped at 10 iterations;
+        2-3 are typical for smooth fluids.
         """
-        raise NotImplementedError("props_Ps_via_jt: filled in commit 2")
+        gamma = state_up.cp / state_up.cv
+        T = state_up.T * (P_new / state_up.P) ** ((gamma - 1.0) / gamma)
+        s_target = state_up.s
+        s_scale = max(abs(s_target), 1.0)
+        state = self.props(P_new, T)
+        for _ in range(10):
+            ds = state.s - s_target
+            if abs(ds) < 1e-7 * s_scale:
+                return state
+            T = T - ds * T / state.cp
+            state = self.props(P_new, T)
+        return state
 
     def hem_throat(
         self,
@@ -538,13 +560,134 @@ class GERGFluid:
         Raises
         ------
         ValueError
-            If neither or both of ``A_vc`` / ``mdot`` are given.
+            If neither or both of ``A_vc`` / ``mdot`` are given, or if any
+            input is non-positive, or if ``P_back >= P_stag``.
         HEMConsistencyError
             If the post-convergence sanity check ``|u - c_HEM|/c_HEM``
             exceeds 5% at a choked solution. A 1-5% deviation emits a
             ``HEMConsistencyWarning`` instead.
         """
-        raise NotImplementedError("hem_throat: filled in commit 2")
+        given_A = A_vc is not None
+        given_m = mdot is not None
+        if given_A == given_m:
+            raise ValueError(
+                "hem_throat requires exactly one of A_vc or mdot; "
+                f"got A_vc={A_vc}, mdot={mdot}"
+            )
+        if P_stag <= 0.0 or T_stag <= 0.0 or P_back <= 0.0:
+            raise ValueError(
+                "P_stag, T_stag, P_back must be positive; got "
+                f"P_stag={P_stag}, T_stag={T_stag}, P_back={P_back}"
+            )
+        if P_back >= P_stag:
+            raise ValueError(
+                f"P_back must be < P_stag; got P_back={P_back}, P_stag={P_stag}"
+            )
+        if given_A and A_vc <= 0.0:
+            raise ValueError(f"A_vc must be positive; got {A_vc}")
+        if given_m and mdot <= 0.0:
+            raise ValueError(f"mdot must be positive; got {mdot}")
+
+        state_stag = self.props(P_stag, T_stag)
+        h_stag = state_stag.h
+
+        def neg_G(P_t: float) -> float:
+            state_t = self.props_Ps_via_jt(P_t, state_stag)
+            delta_h = h_stag - state_t.h
+            if delta_h <= 0.0:
+                return 0.0
+            u_t = math.sqrt(2.0 * delta_h)
+            return -(state_t.rho * u_t)
+
+        P_lo = 0.05 * P_stag
+        P_hi = 0.95 * P_stag
+        result = minimize_scalar(
+            neg_G,
+            bounds=(P_lo, P_hi),
+            method="bounded",
+            options={"xatol": 1e-5 * P_stag},
+        )
+        if not result.success:
+            raise HEMConsistencyError(
+                "Bounded Brent failed to locate G_max on (P_t, s_stag) "
+                f"isentrope: P_stag={P_stag/1e5:.3f} bara, "
+                f"T_stag={T_stag:.2f} K, P_back={P_back/1e5:.3f} bara; "
+                f"scipy message: {result.message}"
+            )
+        P_choke_candidate = float(result.x)
+
+        # Optimum at the bracket boundary (within 1% of P_stag from either
+        # bound) signals no internal maximum was found — the flow is far
+        # from choke or choke lies outside our bracket. Fall back to
+        # subcritical with throat at P_back.
+        at_lower = P_choke_candidate < P_lo + 0.01 * P_stag
+        at_upper = P_choke_candidate > P_hi - 0.01 * P_stag
+        at_bound = at_lower or at_upper
+
+        if at_bound or P_back > P_choke_candidate:
+            choked = False
+            P_t = P_back
+        else:
+            choked = True
+            P_t = P_choke_candidate
+
+        state_t = self.props_Ps_via_jt(P_t, state_stag)
+        delta_h = h_stag - state_t.h
+        if delta_h <= 0.0:
+            raise HEMConsistencyError(
+                f"Non-positive enthalpy drop at throat: P_t={P_t/1e5:.3f} bara, "
+                f"h_stag={h_stag:.0f}, h_t={state_t.h:.0f}"
+            )
+        u_t = math.sqrt(2.0 * delta_h)
+        G_t = state_t.rho * u_t
+
+        if given_A:
+            mdot_out = G_t * A_vc
+            A_vc_out = A_vc
+        else:
+            mdot_out = mdot
+            A_vc_out = mdot / G_t
+
+        # c_HEM via central FD on v(P)|s. δP = 1e-3·P_t stays well within
+        # (P_lo, P_hi) since P_t ∈ (0.06, 0.94)·P_stag in the choked branch
+        # and P_t = P_back ∈ (0, P_stag) in the subcritical branch.
+        delta_P = 1e-3 * P_t
+        state_plus = self.props_Ps_via_jt(P_t + delta_P, state_stag)
+        state_minus = self.props_Ps_via_jt(P_t - delta_P, state_stag)
+        v_t = 1.0 / state_t.rho
+        v_plus = 1.0 / state_plus.rho
+        v_minus = 1.0 / state_minus.rho
+        dPdv_s = (2.0 * delta_P) / (v_plus - v_minus)
+        c_HEM = math.sqrt(-v_t * v_t * dPdv_s)
+        M_t = u_t / c_HEM
+
+        if choked:
+            deviation = abs(u_t - c_HEM) / c_HEM
+            if deviation > 0.05:
+                raise HEMConsistencyError(
+                    f"u_vc/c_HEM mismatch at choke: u={u_t:.2f} m/s, "
+                    f"c_HEM={c_HEM:.2f} m/s, deviation={deviation*100:.2f}% > 5%"
+                )
+            if deviation > 0.01:
+                warnings.warn(
+                    f"u_vc/c_HEM deviation at choke: {deviation*100:.2f}% "
+                    "(1-5% band)",
+                    HEMConsistencyWarning,
+                    stacklevel=2,
+                )
+
+        return ThroatState(
+            P=P_t,
+            T=state_t.T,
+            rho=state_t.rho,
+            u=u_t,
+            M=M_t,
+            mdot=mdot_out,
+            A_vc=A_vc_out,
+            G=G_t,
+            choked=choked,
+            c_HEM=c_HEM,
+        )
 
     @property
     def is_mixture(self) -> bool:
@@ -924,7 +1067,18 @@ class TabulatedFluid:
         PT flashes for the Newton correction loop, keeping HEM-throat
         evaluations off the direct EOS when a table is in use.
         """
-        raise NotImplementedError("props_Ps_via_jt: filled in commit 2")
+        gamma = state_up.cp / state_up.cv
+        T = state_up.T * (P_new / state_up.P) ** ((gamma - 1.0) / gamma)
+        s_target = state_up.s
+        s_scale = max(abs(s_target), 1.0)
+        state = self.props(P_new, T)
+        for _ in range(10):
+            ds = state.s - s_target
+            if abs(ds) < 1e-7 * s_scale:
+                return state
+            T = T - ds * T / state.cp
+            state = self.props(P_new, T)
+        return state
 
     def dew_temperature(self, P: float) -> float | None:
         """Delegate to base — dew T not tabulated; called O(n_stations) per solve."""
