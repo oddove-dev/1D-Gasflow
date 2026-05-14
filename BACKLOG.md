@@ -10,8 +10,20 @@ Format conventions:
 
 ## Active
 
-None at present. EOS table work complete (Item 2) with adaptive grid
-initialization via L/D similarity.
+- **Item 5 — GUI integration for Device + Chain**. Lift the Pipe-only
+  GUI to a chain-aware workflow: input panel hosts a chain elements
+  list (Pipe / Device rows with reorder), BC section auto-detects
+  the BVP mode from which of `(P_in, P_out, mdot)` is left blank,
+  result tabs render per-element blocks and a chain profile plot,
+  `OverChokedError` surfaces as a banner via a new `over_choked`
+  SolverWorker queue kind. Three-commit pattern: scaffolding (widget
+  skeleton + ChainSpec build + over_choked plumbing, single-pipe
+  workflow unchanged) → implementation (Device editor + 3-field BC
+  layout + multi-element rendering + chain profile plot) → tests
+  (GUI input-validation tests + BACKLOG move-to-done). Added on user
+  request to enable interactive orifice modeling; not part of the
+  original AIV sequence. The two acoustic items below shift to
+  Items 6 and 7.
 
 ## Planned
 
@@ -48,7 +60,7 @@ Architectural principles locked in design phase:
 
 Sequence (remaining; Item numbers assigned at implementation start):
 
-- **Acoustic source PWL (EI AVIFF T2.7.3)**: Apply Carucci-Mueller
+- **Item 6 — Acoustic source PWL (EI AVIFF T2.7.3)**: Apply Carucci-Mueller
   formula at each device node and auto-detected section-boundary
   contractions where M_downstream ≥ 0.999·mach_choke. Inputs from
   upstream stagnation (computed by device model). SFF=6 from
@@ -62,7 +74,7 @@ Sequence (remaining; Item numbers assigned at implementation start):
   tolerance.
   Estimate: ~1 day.
 
-- **Acoustic propagation profile**: PWL(x) along chain via piecewise
+- **Item 7 — Acoustic propagation profile**: PWL(x) along chain via piecewise
   60·L/D attenuation through multi-section (D_int switches at section
   boundaries and across devices; attenuation accumulates as running
   sum). Logarithmic summation when multiple upstream sources contribute

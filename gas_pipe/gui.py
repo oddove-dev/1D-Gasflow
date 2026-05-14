@@ -17,11 +17,14 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 
+from .chain import ChainResult, ChainSpec, solve_chain
+from .device import Device
 from .errors import (
     BVPChoked,
     BVPNotBracketedError,
     EOSOutOfRange,
     EOSTwoPhase,
+    OverChokedError,
     SegmentConvergenceError,
     SolverCancelled,
 )
@@ -55,7 +58,8 @@ class SolverWorker:
 
     Result-queue messages, all 3-tuples:
         ('ok', result, elapsed_seconds)
-        ('choked', BVPChoked_exc, elapsed_seconds)   # BVPChoked is not an error
+        ('choked', BVPChoked_exc, elapsed_seconds)         # not an error
+        ('over_choked', OverChokedError_exc, elapsed_seconds)  # Mode 2/3 infeasibility
         ('cancelled', None, elapsed_seconds)
         ('error', exception, traceback_string)
     """
@@ -93,6 +97,13 @@ class SolverWorker:
                 # BVPChoked is a normal outcome, not an error — surfaced
                 # in the UI as a red [CHOKED] banner over the result tabs.
                 self.result_queue.put(("choked", exc, time.time() - t0))
+            except OverChokedError as exc:
+                # Mode 2 / Mode 3 chain infeasibility — also a physically
+                # valid "no solution at these BCs" outcome rather than a
+                # software fault. Surfaced as a banner with the device
+                # diagnostic fields (commit-2 scope adds the full banner;
+                # commit-1 scaffolding shows the status-bar message).
+                self.result_queue.put(("over_choked", exc, time.time() - t0))
             except Exception as exc:
                 tb = traceback.format_exc()
                 self.result_queue.put(("error", exc, tb))
@@ -323,14 +334,19 @@ class MainWindow:
         self._validate_cmd = (self.root.register(_is_numeric_input), "%P")
 
         # ---- Tk variables ------------------------------------------------
-        # Geometry — list of section dicts (display units: m, mm, mm, μm, W/m²/K).
-        # The Skarv default is a single uniform section.
-        self._section_rows: list[dict[str, float]] = [{
-            "length_m": float(_SKARV_GEOMETRY["length_m"]),
-            "id_mm": float(_SKARV_GEOMETRY["inner_diameter_mm"]),
-            "od_mm": float(_SKARV_GEOMETRY["outer_diameter_mm"]),
-            "roughness_um": float(_SKARV_GEOMETRY["roughness_um"]),
-            "U": float(_SKARV_GEOMETRY["overall_U"]),
+        # Chain elements — ordered list of {"kind": "pipe", "sections": [...]} or
+        # {"kind": "device", "A_geom_mm2": ..., "Cd": ..., "name": ...}. The
+        # Skarv default is a single Pipe with one uniform section, which keeps
+        # the single-pipe workflow byte-equivalent to the pre-chain GUI.
+        self._chain_elements: list[dict[str, Any]] = [{
+            "kind": "pipe",
+            "sections": [{
+                "length_m": float(_SKARV_GEOMETRY["length_m"]),
+                "id_mm": float(_SKARV_GEOMETRY["inner_diameter_mm"]),
+                "od_mm": float(_SKARV_GEOMETRY["outer_diameter_mm"]),
+                "roughness_um": float(_SKARV_GEOMETRY["roughness_um"]),
+                "U": float(_SKARV_GEOMETRY["overall_U"]),
+            }],
         }]
         self.var_T_amb = tk.StringVar(value=str(_SKARV_GEOMETRY["ambient_T_C"]))
         # BC
@@ -492,9 +508,68 @@ class MainWindow:
         self._build_run_controls(outer).grid(row=5, column=0, sticky="ew", pady=(6, 0))
 
     def _build_geometry_section(self, parent: tk.Misc) -> ttk.LabelFrame:
-        f = ttk.LabelFrame(parent, text="Pipe geometry sections", padding=6)
+        f = ttk.LabelFrame(parent, text="Chain geometry", padding=6)
         f.columnconfigure(0, weight=1)
         v = self._validate_cmd
+
+        # ---- Chain elements (Pipe / Device, top section) ----------------
+        chain_label = ttk.Label(f, text="Chain elements", anchor="w")
+        chain_label.grid(row=0, column=0, sticky="w", pady=(0, 2))
+
+        chain_cols = ("idx", "kind", "summary")
+        chain_headings = {"idx": "#", "kind": "Kind", "summary": "Summary"}
+        chain_widths = {"idx": 28, "kind": 60, "summary": 280}
+
+        chain_tv_frame = ttk.Frame(f)
+        chain_tv_frame.grid(row=1, column=0, sticky="ew")
+        chain_tv_frame.columnconfigure(0, weight=1)
+
+        chain_tv = ttk.Treeview(
+            chain_tv_frame, columns=chain_cols, show="headings", height=3,
+        )
+        for c in chain_cols:
+            chain_tv.heading(c, text=chain_headings[c])
+            chain_tv.column(
+                c, width=chain_widths[c], anchor="w", stretch=(c == "summary"),
+            )
+        chain_tv.grid(row=0, column=0, sticky="ew")
+        chain_sb = ttk.Scrollbar(
+            chain_tv_frame, orient="vertical", command=chain_tv.yview,
+        )
+        chain_tv.configure(yscrollcommand=chain_sb.set)
+        chain_sb.grid(row=0, column=1, sticky="ns")
+        chain_tv.bind("<Double-1>", lambda _e: self._action_edit_element())
+        chain_tv.bind(
+            "<<TreeviewSelect>>", lambda _e: self._on_chain_selection_changed(),
+        )
+        self._chain_tree = chain_tv
+
+        chain_btns = ttk.Frame(f)
+        chain_btns.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(
+            chain_btns, text="+ Pipe", command=self._action_add_pipe,
+        ).pack(side="left", padx=(0, 4))
+        ttk.Button(
+            chain_btns, text="+ Device", command=self._action_add_device,
+        ).pack(side="left", padx=(0, 4))
+        ttk.Button(
+            chain_btns, text="Edit", command=self._action_edit_element,
+        ).pack(side="left", padx=(0, 4))
+        ttk.Button(
+            chain_btns, text="Remove", command=self._action_remove_element,
+        ).pack(side="left", padx=(0, 4))
+        ttk.Button(
+            chain_btns, text="↑", width=3, command=self._action_move_up_element,
+        ).pack(side="left", padx=(0, 2))
+        ttk.Button(
+            chain_btns, text="↓", width=3, command=self._action_move_down_element,
+        ).pack(side="left")
+
+        # ---- Sections of the selected Pipe (existing Treeview) ----------
+        self._sections_label_var = tk.StringVar(value="Sections of Pipe 1")
+        ttk.Label(f, textvariable=self._sections_label_var, anchor="w").grid(
+            row=3, column=0, sticky="w", pady=(8, 2),
+        )
 
         cols = ("idx", "length", "id", "od", "roughness", "U")
         headings = {
@@ -508,7 +583,7 @@ class MainWindow:
         widths = {"idx": 28, "length": 70, "id": 70, "od": 70, "roughness": 60, "U": 80}
 
         tv_frame = ttk.Frame(f)
-        tv_frame.grid(row=0, column=0, sticky="ew")
+        tv_frame.grid(row=4, column=0, sticky="ew")
         tv_frame.columnconfigure(0, weight=1)
 
         tv = ttk.Treeview(tv_frame, columns=cols, show="headings", height=4)
@@ -522,9 +597,9 @@ class MainWindow:
         tv.bind("<Double-1>", lambda _e: self._action_edit_section())
         self._sections_tree = tv
 
-        # Button row.
+        # Section button row.
         btns = ttk.Frame(f)
-        btns.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        btns.grid(row=5, column=0, sticky="ew", pady=(4, 0))
         ttk.Button(btns, text="+ Add section", command=self._action_add_section).pack(
             side="left", padx=(0, 4)
         )
@@ -537,22 +612,78 @@ class MainWindow:
 
         # Ambient T row.
         amb_row = ttk.Frame(f)
-        amb_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        amb_row.grid(row=6, column=0, sticky="ew", pady=(6, 0))
         amb_row.columnconfigure(1, weight=1)
         _add_labeled_entry(amb_row, 0, "Ambient T [°C]", self.var_T_amb, v)
 
+        # Initial selection: first Pipe element (index 0 by default).
+        self._selected_pipe_index: int = 0
+        self._refresh_chain_tree()
         self._refresh_sections_tree()
         return f
 
     # ------------------------------------------------------------------
-    # Section editor actions
+    # Chain element + section editor actions
     # ------------------------------------------------------------------
+    def _selected_pipe_sections(self) -> list[dict[str, float]] | None:
+        """Return the section list of the currently-selected Pipe element.
+
+        Returns ``None`` if the current selection is not a Pipe (e.g. a
+        Device row is selected, or the chain is empty). Section editing
+        actions check for ``None`` and surface a friendly message.
+        """
+        idx = self._selected_pipe_index
+        if idx is None or idx >= len(self._chain_elements):
+            return None
+        el = self._chain_elements[idx]
+        if el.get("kind") != "pipe":
+            return None
+        return el["sections"]  # type: ignore[no-any-return]
+
+    def _refresh_chain_tree(self) -> None:
+        """Re-render the chain elements Treeview from ``self._chain_elements``."""
+        tv = self._chain_tree
+        for item in tv.get_children():
+            tv.delete(item)
+        for i, el in enumerate(self._chain_elements, start=1):
+            if el["kind"] == "pipe":
+                sections = el["sections"]
+                if len(sections) == 1:
+                    s = sections[0]
+                    summary = (
+                        f"1 section: L={s['length_m']:.1f} m, "
+                        f"ID={s['id_mm']:.0f} mm"
+                    )
+                else:
+                    total_L = sum(s["length_m"] for s in sections)
+                    summary = (
+                        f"{len(sections)} sections: L_total={total_L:.1f} m"
+                    )
+                kind_str = "Pipe"
+            else:  # device
+                A_vc_mm2 = el["A_geom_mm2"] * el["Cd"]
+                name = el.get("name", "")
+                name_str = f" '{name}'" if name else ""
+                summary = (
+                    f"Device{name_str}: A_geom={el['A_geom_mm2']:.1f} mm², "
+                    f"Cd={el['Cd']:.2f}, A_vc={A_vc_mm2:.1f} mm²"
+                )
+                kind_str = "Device"
+            tv.insert("", "end", values=(str(i), kind_str, summary))
+
     def _refresh_sections_tree(self) -> None:
-        """Re-render the sections Treeview from ``self._section_rows``."""
+        """Re-render the sections Treeview for the currently-selected Pipe."""
+        sections = self._selected_pipe_sections()
         tv = self._sections_tree
         for item in tv.get_children():
             tv.delete(item)
-        for i, row in enumerate(self._section_rows, start=1):
+        if sections is None:
+            # No Pipe selected — leave the section view empty.
+            self._sections_label_var.set("Sections (select a Pipe in the chain)")
+            return
+        idx = (self._selected_pipe_index or 0) + 1
+        self._sections_label_var.set(f"Sections of Pipe {idx}")
+        for i, row in enumerate(sections, start=1):
             tv.insert(
                 "", "end",
                 values=(
@@ -565,6 +696,151 @@ class MainWindow:
                 ),
             )
 
+    def _on_chain_selection_changed(self) -> None:
+        """Update ``_selected_pipe_index`` from the chain Treeview selection.
+
+        When a Pipe row is selected, that Pipe's sections appear in the
+        section sub-Treeview. When a Device row is selected, the section
+        sub-Treeview is cleared (device editing happens via the Device
+        modal, not the section sub-Treeview).
+        """
+        sel = self._chain_tree.selection()
+        if not sel:
+            return
+        idx = self._chain_tree.index(sel[0])
+        if idx >= len(self._chain_elements):
+            return
+        el = self._chain_elements[idx]
+        if el["kind"] == "pipe":
+            self._selected_pipe_index = idx
+        # For Device selection, keep _selected_pipe_index unchanged but
+        # the section view will not refresh (the user just inspects the
+        # Device row). To make this less confusing, refresh anyway —
+        # _refresh_sections_tree checks the current selection.
+        self._refresh_sections_tree()
+
+    def _selected_chain_index(self) -> int | None:
+        sel = self._chain_tree.selection()
+        if not sel:
+            return None
+        return self._chain_tree.index(sel[0])
+
+    def _action_add_pipe(self) -> None:
+        """Append a new Pipe element with default Skarv-ish geometry."""
+        new = {
+            "kind": "pipe",
+            "sections": [{
+                "length_m": 10.0,
+                "id_mm": 100.0,
+                "od_mm": 110.0,
+                "roughness_um": 45.0,
+                "U": 0.0,
+            }],
+        }
+        self._chain_elements.append(new)
+        self._refresh_chain_tree()
+
+    def _action_add_device(self) -> None:
+        """Append a new Device element with placeholder values.
+
+        For commit 1 scaffolding, the Device editor is a stub — the user
+        can add a Device and see it in the chain Treeview, but configuring
+        it (changing A_geom / Cd / name) lands in commit 2.
+        """
+        new = {
+            "kind": "device",
+            "A_geom_mm2": 100.0,
+            "Cd": 0.7,
+            "name": "",
+        }
+        self._chain_elements.append(new)
+        self._refresh_chain_tree()
+
+    def _action_edit_element(self) -> None:
+        """Edit the currently-selected chain element via type-aware dispatch."""
+        idx = self._selected_chain_index()
+        if idx is None:
+            messagebox.showinfo(
+                "Edit element",
+                "Select an element in the chain Treeview first.",
+                parent=self.root,
+            )
+            return
+        el = self._chain_elements[idx]
+        if el["kind"] == "pipe":
+            # Selecting a Pipe focuses the section view on it; the user
+            # then edits sections through the existing section editor.
+            self._selected_pipe_index = idx
+            self._refresh_sections_tree()
+            messagebox.showinfo(
+                "Edit Pipe",
+                f"Pipe {idx + 1} is now focused. Use the Sections sub-table "
+                "below to add/edit/remove its sections.",
+                parent=self.root,
+            )
+        else:
+            # Device editor lands in commit 2.
+            raise NotImplementedError(
+                "Device editor is not yet implemented (commit 2 scope). "
+                "For now, default placeholder values "
+                f"(A_geom={el['A_geom_mm2']} mm², Cd={el['Cd']}) are used."
+            )
+
+    def _action_remove_element(self) -> None:
+        """Remove the selected chain element."""
+        idx = self._selected_chain_index()
+        if idx is None:
+            messagebox.showinfo(
+                "Remove element",
+                "Select an element in the chain Treeview first.",
+                parent=self.root,
+            )
+            return
+        if len(self._chain_elements) <= 1:
+            messagebox.showwarning(
+                "Remove element",
+                "At least one element is required in the chain.",
+                parent=self.root,
+            )
+            return
+        del self._chain_elements[idx]
+        # Reset the section-view focus to the first Pipe (if any).
+        for i, el in enumerate(self._chain_elements):
+            if el["kind"] == "pipe":
+                self._selected_pipe_index = i
+                break
+        else:
+            self._selected_pipe_index = None  # type: ignore[assignment]
+        self._refresh_chain_tree()
+        self._refresh_sections_tree()
+
+    def _action_move_up_element(self) -> None:
+        """Move the selected chain element one position toward the inlet."""
+        idx = self._selected_chain_index()
+        if idx is None or idx == 0:
+            return
+        els = self._chain_elements
+        els[idx - 1], els[idx] = els[idx], els[idx - 1]
+        self._refresh_chain_tree()
+        # Re-select the moved element.
+        items = self._chain_tree.get_children()
+        if idx - 1 < len(items):
+            self._chain_tree.selection_set(items[idx - 1])
+
+    def _action_move_down_element(self) -> None:
+        """Move the selected chain element one position toward the outlet."""
+        idx = self._selected_chain_index()
+        if idx is None or idx >= len(self._chain_elements) - 1:
+            return
+        els = self._chain_elements
+        els[idx + 1], els[idx] = els[idx], els[idx + 1]
+        self._refresh_chain_tree()
+        items = self._chain_tree.get_children()
+        if idx + 1 < len(items):
+            self._chain_tree.selection_set(items[idx + 1])
+
+    # ---- Section editor actions (operate on the selected Pipe) ----------
+
     def _selected_section_index(self) -> int | None:
         tv = self._sections_tree
         sel = tv.selection()
@@ -573,49 +849,75 @@ class MainWindow:
         return tv.index(sel[0])
 
     def _action_add_section(self) -> None:
-        """Append a new section, copying defaults from the last existing row."""
-        if self._section_rows:
-            new = dict(self._section_rows[-1])
-        else:
-            new = {
-                "length_m": 10.0, "id_mm": 200.0, "od_mm": 220.0,
-                "roughness_um": 45.0, "U": 0.0,
-            }
-        self._section_rows.append(new)
+        """Append a new section to the currently-selected Pipe."""
+        sections = self._selected_pipe_sections()
+        if sections is None:
+            messagebox.showinfo(
+                "Add section",
+                "Select a Pipe in the chain Treeview first.",
+                parent=self.root,
+            )
+            return
+        new = dict(sections[-1]) if sections else {
+            "length_m": 10.0, "id_mm": 200.0, "od_mm": 220.0,
+            "roughness_um": 45.0, "U": 0.0,
+        }
+        sections.append(new)
         self._refresh_sections_tree()
+        self._refresh_chain_tree()  # update Pipe summary
 
     def _action_remove_section(self) -> None:
-        """Remove the selected section. Refuses to remove the last one."""
+        """Remove the selected section from the currently-selected Pipe."""
+        sections = self._selected_pipe_sections()
+        if sections is None:
+            messagebox.showinfo(
+                "Remove section",
+                "Select a Pipe in the chain Treeview first.",
+                parent=self.root,
+            )
+            return
         idx = self._selected_section_index()
         if idx is None:
             messagebox.showinfo(
                 "Remove section",
-                "Select a row in the sections table first.",
+                "Select a row in the sections sub-table first.",
                 parent=self.root,
             )
             return
-        if len(self._section_rows) <= 1:
+        if len(sections) <= 1:
             messagebox.showwarning(
                 "Remove section",
-                "At least one section is required.",
+                "At least one section is required in each Pipe.",
                 parent=self.root,
             )
             return
-        del self._section_rows[idx]
+        del sections[idx]
         self._refresh_sections_tree()
+        self._refresh_chain_tree()
 
     def _action_edit_section(self) -> None:
-        """Open a modal dialog to edit the selected section's fields."""
+        """Open the section editor for the selected section of the focused Pipe."""
+        sections = self._selected_pipe_sections()
+        if sections is None:
+            messagebox.showinfo(
+                "Edit section",
+                "Select a Pipe in the chain Treeview first.",
+                parent=self.root,
+            )
+            return
         idx = self._selected_section_index()
         if idx is None:
-            if not self._section_rows:
+            if not sections:
                 return
             idx = 0
         self._open_section_editor(idx)
 
     def _open_section_editor(self, idx: int) -> None:
-        """Modal Toplevel editor for section row ``idx``."""
-        row = self._section_rows[idx]
+        """Modal Toplevel editor for section row ``idx`` of the selected Pipe."""
+        sections = self._selected_pipe_sections()
+        if sections is None:
+            return
+        row = sections[idx]
         win = tk.Toplevel(self.root)
         win.title(f"Edit section {idx + 1}")
         win.transient(self.root)
@@ -669,8 +971,9 @@ class MainWindow:
                     parent=win,
                 )
                 return
-            self._section_rows[idx] = new
+            sections[idx] = new
             self._refresh_sections_tree()
+            self._refresh_chain_tree()
             win.destroy()
 
         ttk.Button(btn_row, text="Cancel", command=win.destroy).pack(side="right")
@@ -1223,42 +1526,104 @@ class MainWindow:
                 f"(Σ = {total:.6f}). Use the Normalize button or fix the rows."
             )
 
-        # Geometry — sections list, converted to SI.
-        if not self._section_rows:
-            raise _InputValidationError("At least one pipe section is required.")
-        sections_si: list[dict[str, float]] = []
-        for i, row in enumerate(self._section_rows, start=1):
-            length = float(row["length_m"])
-            id_m = float(row["id_mm"]) * 1e-3
-            od_m = float(row["od_mm"]) * 1e-3
-            roughness_m = float(row["roughness_um"]) * 1e-6
-            U = float(row["U"])
-            if length <= 0 or id_m <= 0 or od_m <= 0 or roughness_m <= 0:
-                raise _InputValidationError(
-                    f"Section {i}: all dimensions must be positive."
-                )
-            if od_m < id_m:
-                raise _InputValidationError(
-                    f"Section {i}: outer diameter ({od_m * 1e3:.1f} mm) must "
-                    f"be ≥ inner diameter ({id_m * 1e3:.1f} mm)."
-                )
-            if U < 0:
-                raise _InputValidationError(
-                    f"Section {i}: overall U must be ≥ 0."
-                )
-            sections_si.append({
-                "length": length,
-                "inner_diameter": id_m,
-                "outer_diameter": od_m,
-                "roughness": roughness_m,
-                "overall_U": U,
-            })
+        # Geometry — chain elements, converted to SI and assembled into
+        # a validated ChainSpec. Single-pipe chains also expose a
+        # legacy pipe_kwargs dict so the plateau-sweep and verify-EOS
+        # actions (which only support single Pipes for now) can keep
+        # using the existing _build_pipe helper.
+        if not self._chain_elements:
+            raise _InputValidationError("Chain must have at least one element.")
         T_amb_K = _parse_float(self.var_T_amb.get(), "Ambient T") + 273.15
 
-        pipe_kwargs = {
-            "sections_si": sections_si,
-            "ambient_temperature": T_amb_K,
-        }
+        chain_elements_built: list[Pipe | Device] = []
+        first_pipe_sections_si: list[dict[str, float]] | None = None
+        for el_idx, el in enumerate(self._chain_elements, start=1):
+            if el["kind"] == "pipe":
+                sections_si: list[dict[str, float]] = []
+                for s_i, row in enumerate(el["sections"], start=1):
+                    length = float(row["length_m"])
+                    id_m = float(row["id_mm"]) * 1e-3
+                    od_m = float(row["od_mm"]) * 1e-3
+                    roughness_m = float(row["roughness_um"]) * 1e-6
+                    U = float(row["U"])
+                    if length <= 0 or id_m <= 0 or od_m <= 0 or roughness_m <= 0:
+                        raise _InputValidationError(
+                            f"Pipe {el_idx} section {s_i}: all dimensions "
+                            "must be positive."
+                        )
+                    if od_m < id_m:
+                        raise _InputValidationError(
+                            f"Pipe {el_idx} section {s_i}: outer diameter "
+                            f"({od_m * 1e3:.1f} mm) must be ≥ inner diameter "
+                            f"({id_m * 1e3:.1f} mm)."
+                        )
+                    if U < 0:
+                        raise _InputValidationError(
+                            f"Pipe {el_idx} section {s_i}: overall U must be ≥ 0."
+                        )
+                    sections_si.append({
+                        "length": length,
+                        "inner_diameter": id_m,
+                        "outer_diameter": od_m,
+                        "roughness": roughness_m,
+                        "overall_U": U,
+                    })
+                pipe_obj = Pipe(
+                    sections=[
+                        PipeSection(
+                            length=s["length"],
+                            inner_diameter=s["inner_diameter"],
+                            outer_diameter=s["outer_diameter"],
+                            roughness=s["roughness"],
+                            overall_U=s["overall_U"],
+                        )
+                        for s in sections_si
+                    ],
+                    ambient_temperature=T_amb_K,
+                )
+                chain_elements_built.append(pipe_obj)
+                if first_pipe_sections_si is None:
+                    first_pipe_sections_si = sections_si
+            else:  # device
+                A_geom_mm2 = float(el["A_geom_mm2"])
+                Cd = float(el["Cd"])
+                name = str(el.get("name", ""))
+                if A_geom_mm2 <= 0:
+                    raise _InputValidationError(
+                        f"Device {el_idx}: A_geom must be > 0, "
+                        f"got {A_geom_mm2}."
+                    )
+                if not (0.0 < Cd <= 1.0):
+                    raise _InputValidationError(
+                        f"Device {el_idx}: Cd must be in (0, 1], got {Cd}."
+                    )
+                device_obj = Device(
+                    A_geom=A_geom_mm2 * 1e-6,  # mm² → m²
+                    Cd=Cd,
+                    name=name,
+                )
+                chain_elements_built.append(device_obj)
+
+        try:
+            chain = ChainSpec(elements=chain_elements_built)
+        except ValueError as exc:
+            raise _InputValidationError(f"Chain spec invalid: {exc}") from exc
+
+        # Legacy pipe_kwargs for actions that still go through _build_pipe.
+        # Populated only when the chain is a single Pipe — multi-element
+        # chains require commit-2-scope updates to those actions.
+        is_single_pipe = (
+            len(chain_elements_built) == 1
+            and isinstance(chain_elements_built[0], Pipe)
+        )
+        pipe_kwargs: dict[str, Any] | None
+        if is_single_pipe and first_pipe_sections_si is not None:
+            pipe_kwargs = {
+                "sections_si": first_pipe_sections_si,
+                "ambient_temperature": T_amb_K,
+            }
+        else:
+            pipe_kwargs = None
 
         # Boundary conditions
         P_in = _parse_positive_float(self.var_P_in.get(), "Inlet P") * 1e5
@@ -1295,10 +1660,13 @@ class MainWindow:
         # the chosen mode.
         adaptive = bool(self.var_adaptive.get())
 
-        # Pipe length and reference diameter (first section) for the
-        # adaptive / dimensionless initial-N calculation.
-        L_pipe = sum(s["length"] for s in pipe_kwargs["sections_si"])
-        D_ref = float(pipe_kwargs["sections_si"][0]["inner_diameter"])
+        # Pipe length and reference diameter (first Pipe's first section)
+        # for the adaptive / dimensionless initial-N calculation. For
+        # multi-element chains the first Pipe is the reference; chain
+        # solver applies per-pipe discretization downstream the same way.
+        first_pipe = chain.pipes[0]
+        L_pipe = float(first_pipe.length)
+        D_ref = float(first_pipe.sections[0].inner_diameter)
 
         discretization: dict[str, Any]
         if adaptive:
@@ -1397,6 +1765,7 @@ class MainWindow:
 
         return {
             "composition": composition,
+            "chain": chain,
             "pipe_kwargs": pipe_kwargs,
             "bc": bc,
             "solver_kwargs": solver_kwargs,
@@ -1436,7 +1805,6 @@ class MainWindow:
         # Build solver inputs on the Tk thread (cheap, validates EOS too).
         try:
             fluid = GERGFluid(inputs["composition"])
-            pipe = _build_pipe(inputs["pipe_kwargs"])
         except EOSOutOfRange as exc:
             self._show_solver_error(
                 "EOS out of range",
@@ -1448,72 +1816,63 @@ class MainWindow:
         except Exception as exc:
             self._show_solver_error(
                 f"Setup error: {type(exc).__name__}",
-                "Could not construct fluid/pipe from inputs.",
+                "Could not construct fluid from inputs.",
                 exc,
             )
             return
 
+        chain: ChainSpec = inputs["chain"]
         bc = inputs["bc"]
         solver_kwargs = inputs["solver_kwargs"]
         eos_kwargs = inputs["eos_kwargs"]
         discretization = inputs["discretization"]
 
-        # IVP doesn't take eos_mode (march_ivp's signature); if the user
-        # picked table mode and IVP, wrap the fluid up-front so the march
-        # still benefits — defensive window since IVP has no P_out target.
-        def _wrap_fluid_for_ivp() -> "FluidEOSBase":
-            if eos_kwargs.get("eos_mode") != "table":
-                return fluid
-            P_range = eos_kwargs.get("P_range_override")
-            T_range = eos_kwargs.get("T_range_override")
-            if P_range is None:
-                # IVP: no P_out → pessimistic window (5% of P_in to 110% P_in,
-                # T_in-100 K to T_in+30 K).
-                P_range = (0.05 * bc["P_in"], 1.1 * bc["P_in"])
-            if T_range is None:
-                T_range = (bc["T_in"] - 100.0, bc["T_in"] + 30.0)
-            return TabulatedFluid(
-                fluid, P_range, T_range,
-                eos_kwargs.get("table_n_P", 50),
-                eos_kwargs.get("table_n_T", 50),
-            )
+        # Map the legacy GUI BC mode to solve_chain keyword args.
+        # IVP → Mode 2 (P_in + mdot). BVP → Mode 1 (P_in + P_out).
+        # Mode 3 (P_out + mdot) is not yet wired through the GUI — the
+        # 3-field BC layout that exposes it lands in commit 2.
+        if bc["mode"] == "IVP":
+            chain_kwargs = {"P_in": bc["P_in"], "mdot": bc["mdot"]}
+        else:
+            chain_kwargs = {"P_in": bc["P_in"], "P_out": bc["P_out"]}
 
-        def _stamp_discretization(r: "PipeResult") -> "PipeResult":
-            # Stamp the discretization choice onto the result so the
-            # summary can render the correct mode line. We do this at
-            # the GUI level (rather than passing discretization through
-            # march_ivp) so the solver core stays oblivious to GUI-side
-            # UX decisions.
-            r.solver_options["discretization"] = dict(discretization)
-            r.solver_options["pipe_inner_diameter"] = float(
-                pipe.sections[0].inner_diameter
-            )
-            return r
+        first_pipe_D = float(chain.pipes[0].sections[0].inner_diameter)
 
-        # Define the work the worker thread will do. Closes over `bc`,
-        # `solver_kwargs`, `fluid`, `pipe`, and the worker's cancel_event.
-        # BVPChoked carries a result on the exception object — we stamp
-        # it before re-raising so the choked summary still shows the
-        # discretization line.
-        def _do_solve() -> "PipeResult":
+        def _stamp_discretization_on_chain(result: ChainResult) -> ChainResult:
+            """Stamp discretization metadata on each per-pipe PipeResult.
+
+            Mirrors the pre-chain GUI behavior: every PipeResult that
+            renders in the Summary tab needs the discretization line
+            (chain march doesn't know the GUI-side choice).
+
+            Documented assumption: DeviceResult does not have a
+            ``solver_options`` attribute, so the ``hasattr`` check below
+            cleanly skips device entries. If a future DeviceResult ever
+            grows per-device options, that field name must NOT collide
+            with the discretization keys stamped here — alternative:
+            switch to ``isinstance(r, PipeResult)``.
+            """
+            for r in result.results:
+                if hasattr(r, "solver_options"):
+                    r.solver_options["discretization"] = dict(discretization)
+                    r.solver_options["pipe_inner_diameter"] = first_pipe_D
+            return result
+
+        def _do_solve() -> ChainResult:
             cancel_event = self._worker.cancel_event
             try:
-                if bc["mode"] == "IVP":
-                    wrapped = _wrap_fluid_for_ivp()
-                    r = march_ivp(
-                        pipe, wrapped, bc["P_in"], bc["T_in"], bc["mdot"],
-                        cancel_event=cancel_event, **solver_kwargs,
-                    )
-                else:
-                    r = solve_for_mdot(
-                        pipe, fluid, bc["P_in"], bc["T_in"], bc["P_out"],
-                        cancel_event=cancel_event,
-                        **eos_kwargs, **solver_kwargs,
-                    )
+                r = solve_chain(
+                    chain, fluid, T_in=bc["T_in"],
+                    cancel_event=cancel_event,
+                    **chain_kwargs,
+                    **eos_kwargs, **solver_kwargs,
+                )
             except BVPChoked as exc:
-                _stamp_discretization(exc.result)
+                # BVPChoked.result is now a ChainResult; stamp discretization
+                # on each PipeResult inside so the choked summary renders.
+                _stamp_discretization_on_chain(exc.result)
                 raise
-            return _stamp_discretization(r)
+            return _stamp_discretization_on_chain(r)
 
         # ---- UI: enter "running" state ----------------------------------
         self._current_run_kind = "analysis"
@@ -1770,7 +2129,33 @@ class MainWindow:
             # BVPChoked per-point internally and returns 'ok'.
             _, exc, elapsed = msg
             self._populate_all_tabs(exc.result)
-            self.var_status.set(f"[CHOKED] Done ({elapsed:.1f} s)")
+            # Surface device-induced choke location when available.
+            diag = getattr(exc.result, "choke_diagnostics", None) or {}
+            if diag.get("kind") == "device_over_choked":
+                loc = (
+                    f" — device '{diag.get('element_name', '?')}' "
+                    f"(index {diag.get('element_index', '?')})"
+                )
+            else:
+                loc = ""
+            self.var_status.set(
+                f"[CHOKED] ṁ_critical = {exc.mdot_critical:.3f} kg/s"
+                f"{loc} ({elapsed:.1f} s)"
+            )
+            self._status_label.configure(foreground="#C42B1C")
+
+        elif kind == "over_choked":
+            # Mode 2 / Mode 3 chain infeasibility. Tabs aren't populated
+            # (no ChainResult was produced); commit-2 will add a banner
+            # overlay; for commit-1 scaffolding the status bar carries
+            # the diagnostic so the user knows what happened.
+            _, exc, elapsed = msg
+            self.var_status.set(
+                f"[OVER-CHOKED] device '{exc.device_name or '?'}' "
+                f"(index {exc.device_index}) max ṁ = {exc.max_mdot:.3f} "
+                f"vs attempted {exc.attempted_mdot:.3f} kg/s "
+                f"({elapsed:.1f} s)"
+            )
             self._status_label.configure(foreground="#C42B1C")
 
         elif kind == "cancelled":
@@ -1988,11 +2373,67 @@ class MainWindow:
         self._status_label.configure(foreground="#C42B1C")
         messagebox.showerror(title, f"{message}\n\n{exc}", parent=self.root)
 
-    def _populate_all_tabs(self, result: "PipeResult") -> None:
-        self._populate_summary_tab(result)
-        self._populate_profile_tab(result)
-        self._populate_table_tab(result)
+    def _populate_all_tabs(self, result: "ChainResult | PipeResult") -> None:
+        """Populate Summary / Profile / Station tabs from a ChainResult or
+        legacy PipeResult.
+
+        Single-pipe chains (one Pipe element, no Devices) unwrap to a
+        PipeResult and feed the existing populators byte-equivalently —
+        the pre-chain rendering is preserved exactly.
+
+        Multi-element chains land in commit 2; for now they raise
+        :class:`NotImplementedError` with a friendly message.
+        """
+        from .results import PipeResult
+
+        if isinstance(result, ChainResult):
+            if (
+                len(result.results) == 1
+                and isinstance(result.results[0], PipeResult)
+            ):
+                pipe_result = result.results[0]
+            else:
+                # Multi-element rendering is commit-2 scope.
+                self._populate_multi_element_placeholder(result)
+                return
+        else:
+            pipe_result = result  # legacy / backward-compat path
+
+        self._populate_summary_tab(pipe_result)
+        self._populate_profile_tab(pipe_result)
+        self._populate_table_tab(pipe_result)
         # Plateau Sweep tab is populated separately by the sweep button.
+
+    def _populate_multi_element_placeholder(self, result: ChainResult) -> None:
+        """Stub renderer for multi-element ChainResult (commit 1 scope).
+
+        Replaces the result tabs with a "coming in commit 2" message and
+        a minimal text summary so the user can verify the solver actually
+        ran. Full per-element rendering is commit-2 work.
+        """
+        n_pipes = len(result.pipe_results)
+        n_devices = len(result.device_results)
+        msg = (
+            f"Multi-element chain solved: {n_pipes} pipe(s), "
+            f"{n_devices} device(s).\n"
+            f"  mdot = {result.mdot:.4f} kg/s\n"
+            f"  P_in = {result.P_in/1e5:.3f} bara → "
+            f"P_out = {result.P_out/1e5:.3f} bara\n"
+            f"  T_in = {result.T_in-273.15:.2f} °C → "
+            f"T_out = {result.T_out-273.15:.2f} °C\n"
+            f"  Elapsed: {result.elapsed:.1f} s\n\n"
+            "Multi-element tab rendering (per-element blocks, chain profile,\n"
+            "device-aware station table) is implemented in commit 2 of "
+            "Item 5."
+        )
+        self._summary_text.configure(state="normal")
+        self._summary_text.delete("1.0", "end")
+        self._summary_text.insert("end", msg)
+        self._summary_text.configure(state="disabled")
+        self._summary_text.see("1.0")
+        # Leave profile / station tabs untouched — they show whatever was
+        # last rendered (typically the previous single-pipe run, or a
+        # blank state for a fresh session).
 
     @staticmethod
     def _classify_severity(result: "PipeResult") -> tuple[str | None, str | None]:
