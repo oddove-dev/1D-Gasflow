@@ -14,6 +14,7 @@ from .eos import (
     FluidState,
     GERGFluid,
     TabulatedFluid,
+    ThroatState,
     estimate_operating_window,
 )
 from .errors import (
@@ -23,6 +24,8 @@ from .errors import (
     EOSOutOfRange,
     EOSTwoPhase,
     GasPipeError,
+    HEMConsistencyError,
+    HEMConsistencyWarning,
     IntegrationCapExceeded,
     SegmentConvergenceError,
     SolverCancelled,
@@ -43,6 +46,7 @@ __all__ = [
     "TabulatedFluid",
     "FluidEOSBase",
     "FluidState",
+    "ThroatState",
     "ALLOWED_COMPONENTS",
     "estimate_operating_window",
     "Pipe",
@@ -61,6 +65,8 @@ __all__ = [
     "ChokeReached",
     "BVPChoked",
     "BVPNotBracketedError",
+    "HEMConsistencyError",
+    "HEMConsistencyWarning",
     "IntegrationCapExceeded",
     "SolverCancelled",
 ]

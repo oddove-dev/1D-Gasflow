@@ -58,3 +58,24 @@ class BVPChoked(GasPipeError):
         super().__init__(message)
         self.mdot_critical = mdot_critical
         self.result = result
+
+
+class HEMConsistencyError(GasPipeError):
+    """u_vc deviates from c_HEM by >5% at HEM throat convergence.
+
+    Indicates G_max iteration converged to a non-physical local maximum,
+    or HEOS Ps-flash drifted significantly, or HEM is not applicable in
+    this thermodynamic region. The returned ThroatState cannot be trusted.
+    """
+    pass
+
+
+class HEMConsistencyWarning(UserWarning):
+    """u_vc deviates from c_HEM by 1-5% at HEM throat convergence.
+
+    Result is usable but indicates numerical noise on the c_HEM finite
+    difference or marginal Ps-flash convergence. Worth investigating if
+    it recurs. Subclasses UserWarning (not GasPipeError) because
+    warnings.warn requires a Warning ancestry.
+    """
+    pass

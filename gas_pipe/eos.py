@@ -100,6 +100,55 @@ class FluidState:
     metastable: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class ThroatState:
+    """HEM throat (vena-contracta) state for a pressure-reducing source.
+
+    Returned by :meth:`GERGFluid.hem_throat` regardless of whether the
+    geometry input was ``A_vc`` (mode A) or ``mdot`` (mode B); all fields
+    are always populated.
+
+    Parameters
+    ----------
+    P : float
+        Static pressure at the vena contracta [Pa]. Equals the
+        choke-limited throat pressure when ``choked``, otherwise equals
+        ``P_back``.
+    T : float
+        Static temperature at the vena contracta [K].
+    rho : float
+        Density at the vena contracta [kg/m³].
+    u : float
+        Bulk velocity at the vena contracta [m/s], from the energy
+        balance ``h_stag = h + u²/2``.
+    M : float
+        Mach number ``u / c_HEM`` [-].
+    mdot : float
+        Mass flow rate [kg/s].
+    A_vc : float
+        Vena-contracta area [m²].
+    G : float
+        Mass flux at the throat ``rho · u`` [kg/m²/s].
+    choked : bool
+        True iff the solution is at the G_max point on the stagnation
+        isentrope (i.e. ``P_back`` lies below the choke pressure).
+    c_HEM : float
+        HEM speed of sound at the throat [m/s]. Equal to the GERG
+        single-phase sound speed in single-phase regions.
+    """
+
+    P: float
+    T: float
+    rho: float
+    u: float
+    M: float
+    mdot: float
+    A_vc: float
+    G: float
+    choked: bool
+    c_HEM: float
+
+
 @runtime_checkable
 class FluidEOSBase(Protocol):
     """Common interface for fluid EOS implementations.
@@ -123,6 +172,16 @@ class FluidEOSBase(Protocol):
         self, P_new: float, state_up: "FluidState"
     ) -> "FluidState":
         """JT-estimated isenthalpic flash (robust for HEOS mixtures)."""
+        ...
+
+    def props_Ps_via_jt(
+        self, P_new: float, state_up: "FluidState"
+    ) -> "FluidState":
+        """Ideal-gas-estimated isentropic flash, Newton-corrected on s.
+
+        Parallels :meth:`props_Ph_via_jt` for cases where the HEOS Ps-flash
+        is unreliable for mixtures (same dysfunction class as the Ph-flash).
+        """
         ...
 
     def dew_temperature(self, P: float) -> float | None:
@@ -420,6 +479,72 @@ class GERGFluid:
         dP = P_new - state_up.P
         T_new = state_up.T + state_up.mu_JT * dP
         return self.props(P_new, T_new)
+
+    def props_Ps_via_jt(self, P_new: float, state_up: FluidState) -> FluidState:
+        """Isentropic flash via ideal-gas estimate then Newton correction on s.
+
+        Robust alternative to a direct HEOS Ps-flash for mixtures. Uses
+        the ideal-gas isentropic relation ``T·P^((1-γ)/γ) = const`` for the
+        first guess (with ``γ = cp/cv`` from ``state_up``), then PT-flashes
+        and applies Newton steps ``ΔT = -(s_new - s_up)·T_new/cp_new`` until
+        the entropy residual is below tolerance.
+        """
+        raise NotImplementedError("props_Ps_via_jt: filled in commit 2")
+
+    def hem_throat(
+        self,
+        P_stag: float,
+        T_stag: float,
+        P_back: float,
+        *,
+        A_vc: float | None = None,
+        mdot: float | None = None,
+    ) -> ThroatState:
+        """Solve the HEM throat state for an inline source.
+
+        Maximizes mass flux ``G = ρ·u`` along the ``s_stag`` isentrope
+        using bounded Brent on ``P_t ∈ [0.05·P_stag, 0.95·P_stag]``. If
+        ``P_back ≥ P_choke`` the source is unchoked and the throat sits
+        at ``P_back``; otherwise it sits at the choke pressure.
+
+        Exactly one of ``A_vc`` or ``mdot`` must be given:
+
+        - mode A (``A_vc`` given): geometry-driven; returns
+          ``mdot = G · A_vc``.
+        - mode B (``mdot`` given): returns the implied
+          ``A_vc = mdot / G``. No geometric sanity check is performed at
+          this layer (no knowledge of the surrounding pipe area); the
+          device-model layer owns ``A_vc / A_pipe`` validation.
+
+        Parameters
+        ----------
+        P_stag : float
+            Upstream stagnation pressure [Pa].
+        T_stag : float
+            Upstream stagnation temperature [K].
+        P_back : float
+            Downstream back pressure [Pa]. Discriminates choked vs.
+            subcritical solution.
+        A_vc : float, optional
+            Vena-contracta area [m²]. Exclusive with ``mdot``.
+        mdot : float, optional
+            Mass flow rate [kg/s]. Exclusive with ``A_vc``.
+
+        Returns
+        -------
+        ThroatState
+            Full vena-contracta state with all fields populated.
+
+        Raises
+        ------
+        ValueError
+            If neither or both of ``A_vc`` / ``mdot`` are given.
+        HEMConsistencyError
+            If the post-convergence sanity check ``|u - c_HEM|/c_HEM``
+            exceeds 5% at a choked solution. A 1-5% deviation emits a
+            ``HEMConsistencyWarning`` instead.
+        """
+        raise NotImplementedError("hem_throat: filled in commit 2")
 
     @property
     def is_mixture(self) -> bool:
@@ -789,6 +914,17 @@ class TabulatedFluid:
         dP = P_new - state_up.P
         T_new = state_up.T + state_up.mu_JT * dP
         return self.props(P_new, T_new)
+
+    def props_Ps_via_jt(
+        self, P_new: float, state_up: FluidState
+    ) -> FluidState:
+        """Ideal-gas-estimated isentropic flash, routed through this table.
+
+        Mirrors :meth:`GERGFluid.props_Ps_via_jt` but uses table-backed
+        PT flashes for the Newton correction loop, keeping HEM-throat
+        evaluations off the direct EOS when a table is in use.
+        """
+        raise NotImplementedError("props_Ps_via_jt: filled in commit 2")
 
     def dew_temperature(self, P: float) -> float | None:
         """Delegate to base — dew T not tabulated; called O(n_stations) per solve."""
