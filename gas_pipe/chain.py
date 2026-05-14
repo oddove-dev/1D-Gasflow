@@ -431,37 +431,52 @@ def solve_chain(
         from .solver import _bvp_single_pipe_mdot
 
         pipe = chain.elements[0]
-        pipe_result = _bvp_single_pipe_mdot(
-            pipe, fluid, P_in, T_in, P_out,
-            mdot_bracket=mdot_bracket,
-            rtol=rtol,
-            progress_callback=progress_callback,
-            cancel_event=cancel_event,
-            eos_mode=eos_mode,
-            table_n_P=table_n_P,
-            table_n_T=table_n_T,
-            P_range_override=P_range_override,
-            T_range_override=T_range_override,
-            **ivp_kwargs,
-        )
-        return ChainResult(
-            chain=chain,
-            results=[pipe_result],
-            mdot=pipe_result.mdot,
-            P_in=P_in,
-            P_out=float(pipe_result.P[-1]),
-            T_in=T_in,
-            T_out=float(pipe_result.T[-1]),
-            boundary_conditions=bcs,
-            solver_options=dict(pipe_result.solver_options or {}),
-            elapsed=time.time() - t0,
-            choked=bool(pipe_result.choked),
-            choke_diagnostics=(
-                {"kind": "fanno_pipe", "element_index": 0,
-                 "x_choke": pipe_result.x_choke}
-                if pipe_result.choked else None
-            ),
-        )
+
+        def _wrap_pipe_result_in_chain(pr: "PipeResult") -> ChainResult:
+            return ChainResult(
+                chain=chain,
+                results=[pr],
+                mdot=pr.mdot,
+                P_in=P_in,
+                P_out=float(pr.P[-1]),
+                T_in=T_in,
+                T_out=float(pr.T[-1]),
+                boundary_conditions=bcs,
+                solver_options=dict(pr.solver_options or {}),
+                elapsed=time.time() - t0,
+                choked=bool(pr.choked),
+                choke_diagnostics=(
+                    {"kind": "fanno_pipe", "element_index": 0,
+                     "x_choke": pr.x_choke}
+                    if pr.choked else None
+                ),
+            )
+
+        try:
+            pipe_result = _bvp_single_pipe_mdot(
+                pipe, fluid, P_in, T_in, P_out,
+                mdot_bracket=mdot_bracket,
+                rtol=rtol,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+                eos_mode=eos_mode,
+                table_n_P=table_n_P,
+                table_n_T=table_n_T,
+                P_range_override=P_range_override,
+                T_range_override=T_range_override,
+                **ivp_kwargs,
+            )
+        except BVPChoked as exc:
+            # Uniform exception contract: solve_chain's BVPChoked.result
+            # is always a ChainResult. _bvp_single_pipe_mdot raises with
+            # a PipeResult payload, so wrap before re-raising.
+            wrapped = _wrap_pipe_result_in_chain(exc.result)
+            raise BVPChoked(
+                str(exc),
+                mdot_critical=exc.mdot_critical,
+                result=wrapped,
+            ) from exc
+        return _wrap_pipe_result_in_chain(pipe_result)
 
     # ------------------------------------------------------------------
     # Multi-element or non-Mode-1 path.

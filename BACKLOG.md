@@ -133,6 +133,12 @@ Sequence (remaining; Item numbers assigned at implementation start):
 
 ## Done
 
+- **2026-05-14**: Chain-layer hotfix — `solve_chain` Mode 1 single-pipe
+  fast-path wraps `BVPChoked.result` PipeResult in a single-element
+  `ChainResult` for a uniform exception payload type with the
+  multi-element code path. Regression test added in `tests/test_chain.py`
+  (`test_mode1_single_pipe_bvpchoked_returns_chainresult`). Discovered
+  during Item 5 commit 1 GUI scaffolding.
 - **2026-05-14**: Item 4 — Inline device model + multi-element BVP.
   `Device.solve` does stagnation Newton → HEM throat (mode A) →
   Borda-Carnot 2D Newton transition; `Device.from_stagnation` covers

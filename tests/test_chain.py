@@ -134,6 +134,38 @@ class TestMode1BVPChokedMapping:
         # choke-boundary stagnation
         assert exc.mdot_critical == pytest.approx(diag["max_mdot"], rel=1e-2)
 
+    def test_mode1_single_pipe_bvpchoked_returns_chainresult(self) -> None:
+        """Regression: single-pipe Mode 1 fast-path must wrap the
+        underlying PipeResult in a ChainResult on choke so
+        solve_chain's exception contract is uniform with multi-element
+        chains. Without the wrap, BVPChoked.result is the bare
+        PipeResult that _bvp_single_pipe_mdot raised with.
+
+        Uses local fluid + pipe (not the module-scoped fixtures) so the
+        aggressive choke search (P_out → 1 bara) doesn't pollute the
+        shared GERGFluid cache and perturb the byte-identical-regression
+        test's brentq trajectory.
+        """
+        from gas_pipe.chain import ChainResult
+
+        local_fluid = GERGFluid({"Methane": 1.0})
+        local_pipe = Pipe(sections=[PipeSection(
+            length=10.0, inner_diameter=0.1, roughness=4.5e-5,
+        )])
+        chain = ChainSpec(elements=[local_pipe])
+        with pytest.raises(BVPChoked) as excinfo:
+            solve_chain(
+                chain, local_fluid, T_in=300.0,
+                P_in=50e5, P_out=1e5,
+                eos_mode="direct",
+            )
+        assert isinstance(excinfo.value.result, ChainResult), (
+            f"BVPChoked.result must be ChainResult; "
+            f"got {type(excinfo.value.result).__name__}"
+        )
+        assert excinfo.value.mdot_critical > 0.0
+        assert len(excinfo.value.result.results) == 1
+
 
 class TestMode2OverChokedDiagnostics:
     """Mode 2 with ``mdot`` just above device capacity propagates

@@ -898,19 +898,38 @@ def solve_for_mdot(
     ------
     Same as :func:`_bvp_single_pipe_mdot` (``BVPChoked``,
     ``BVPNotBracketedError``, ``IntegrationCapExceeded``,
-    ``SolverCancelled``).
+    ``SolverCancelled``). For backward compatibility with legacy
+    callers, ``BVPChoked.result`` is unwrapped from the chain solver's
+    ``ChainResult`` payload back to the inner ``PipeResult``.
     """
-    from .chain import ChainSpec, solve_chain
+    from .chain import ChainResult, ChainSpec, solve_chain
 
     chain = ChainSpec(elements=[pipe])
-    chain_result = solve_chain(
-        chain,
-        fluid,
-        T_in=T_in,
-        P_in=P_in,
-        P_out=P_out,
-        **kwargs,
-    )
+    try:
+        chain_result = solve_chain(
+            chain,
+            fluid,
+            T_in=T_in,
+            P_in=P_in,
+            P_out=P_out,
+            **kwargs,
+        )
+    except BVPChoked as exc:
+        # solve_chain raises BVPChoked with a ChainResult payload (for
+        # uniform contract across single-pipe and multi-element paths).
+        # Legacy solve_for_mdot callers (tests, GUI, AIFF integrations)
+        # expect a PipeResult — unwrap the single chain element.
+        if (
+            isinstance(exc.result, ChainResult)
+            and exc.result.results
+        ):
+            pipe_result = exc.result.results[0]
+            raise BVPChoked(
+                str(exc),
+                mdot_critical=exc.mdot_critical,
+                result=pipe_result,
+            ) from exc
+        raise
     return chain_result.results[0]
 
 
