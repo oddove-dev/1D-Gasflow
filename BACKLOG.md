@@ -48,33 +48,6 @@ Architectural principles locked in design phase:
 
 Sequence (remaining; Item numbers assigned at implementation start):
 
-- **Inline device model + multi-element BVP**: `Device` element taking
-  upstream pipe state, geometry (A_geom, Cd), downstream pipe geometry.
-  Internally: compute stagnation from upstream pipe state
-  (h_stag = h_static + u²/2), call HEM throat (always mode A
-  geometry-driven), Borda-Carnot momentum balance to downstream pipe
-  inlet. Returns `DeviceResult` with (ThroatState, TransitionResult,
-  η_dissipation, dh_static, ds). Convenience constructor
-  `Device.from_stagnation` for u_upstream=0 case (PSV on tank).
-
-  Simultaneously: `solve_chain(chain, fluid, *, P_in=None, P_out=None,
-  mdot=None)` with three-mode dispatch:
-    - P_in + P_out → solve for mdot (Newton on mdot, existing
-      BVP pattern extended to chain)
-    - P_in + mdot → solve for P_out (forward march)
-    - P_out + mdot → solve for P_in (backward march)
-  Validates exactly two of three given; raises clear error otherwise.
-  Devices always use geometry-driven mode internally. Choked validation
-  runtime during march; raise `OverChokedError` with diagnostic info
-  (device location, max possible mdot) on conflict. Plain pipe is a
-  chain of length 1; existing `solve_for_mdot` becomes thin wrapper
-  around `solve_chain`.
-  Tests: all three modes converge to same point on round-trip,
-  Borda-Carnot grenseverdier (A_vc/A_pipe → 0 gives η → 1;
-  A_vc/A_pipe → 1 gives η → 0), choked-conflict diagnostics fire
-  correctly, single-pipe regression vs existing `solve_for_mdot`.
-  Estimate: ~3–4 days.
-
 - **Acoustic source PWL (EI AVIFF T2.7.3)**: Apply Carucci-Mueller
   formula at each device node and auto-detected section-boundary
   contractions where M_downstream ≥ 0.999·mach_choke. Inputs from
@@ -148,6 +121,18 @@ Sequence (remaining; Item numbers assigned at implementation start):
 
 ## Done
 
+- **2026-05-14**: Item 4 — Inline device model + multi-element BVP.
+  `Device.solve` does stagnation Newton → HEM throat (mode A) →
+  Borda-Carnot 2D Newton transition; `Device.from_stagnation` covers
+  the PSV-on-tank case. `ChainSpec` + `solve_chain` provide three-mode
+  BVP dispatch (P_in+P_out → mdot, P_in+mdot → P_out, P_out+mdot →
+  P_in); `OverChokedError` maps to `BVPChoked` in Mode 1 (with
+  reachability check) and surfaces with Mode-3-specific message in
+  Mode 3 infeasibility. `solve_for_mdot` rewired as 14-line wrapper.
+  `TabulatedFluid.base_fluid` accessor added so chain code routes HEM
+  through `GERGFluid` while keeping pipe march on the table. Second
+  item of the AIV / HEM-source sequence. Three commits: scaffolding
+  (`69fc758`), implementation (`feacc77`), tests (this commit).
 - **2026-05-14**: Item 3 — HEM throat solver core (`GERGFluid.hem_throat`,
   `props_Ps_via_jt`). Bounded-Brent G_max maximization on the (P_t, s_stag)
   isentrope; `ThroatState` with all fields populated for both `A_vc` and

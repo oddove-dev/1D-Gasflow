@@ -668,11 +668,12 @@ def _mode1_brentq(
         mdot_lo = mdot_lo * 1.5 if mdot_lo > 0 else mdot_hi * 0.01
         f_lo = _obj(mdot_lo)
 
-    # If hi is choked, this becomes a BVPChoked at the boundary. Need to
-    # find mdot_critical via bisection between last good (lo) and choked (hi).
+    # If hi is choked, locate mdot_critical and decide whether the target
+    # P_out is reachable below it (mirrors the legacy
+    # _bvp_single_pipe_mdot pattern).
     if f_hi == _CHOKED_SENTINEL:
         if f_lo == _CHOKED_SENTINEL:
-            # Entire bracket is choked — infeasible
+            # Entire bracket is choked — infeasible at any probed mdot.
             raise BVPChoked(
                 "Chain choked throughout the mdot bracket; "
                 f"no feasible mdot in [{mdot_lo:.3f}, {mdot_hi:.3f}] kg/s.",
@@ -696,16 +697,25 @@ def _mode1_brentq(
                 m_lo = m_mid
         mdot_critical = m_lo
         r_crit = _march(mdot_critical)
-        # Mark as choked and surface as BVPChoked.
-        r_crit.choked = True
-        r_crit.choke_diagnostics = last_choke_diag or {"kind": "boundary"}
-        raise BVPChoked(
-            f"Chain choked at mdot_critical={mdot_critical:.4f} kg/s; "
-            f"target P_out={P_out_target/1e5:.3f} bara is unreachable. "
-            f"Choke diagnostic: {last_choke_diag}",
-            mdot_critical=mdot_critical,
-            result=r_crit,
-        )
+        P_out_crit = r_crit.P_out
+
+        if P_out_crit > P_out_target * (1.0 + rtol):
+            # At choke-limited mdot, P_out is still above target → target
+            # is below the choke-limited minimum and cannot be reached.
+            r_crit.choked = True
+            r_crit.choke_diagnostics = last_choke_diag or {"kind": "boundary"}
+            raise BVPChoked(
+                f"Chain choked at mdot_critical={mdot_critical:.4f} kg/s; "
+                f"target P_out={P_out_target/1e5:.3f} bara is unreachable. "
+                f"Choke diagnostic: {last_choke_diag}",
+                mdot_critical=mdot_critical,
+                result=r_crit,
+            )
+
+        # Target IS reachable below mdot_critical — tighten the upper
+        # bracket and continue with brentq on the smooth branch.
+        mdot_hi = mdot_critical
+        f_hi = P_out_crit - P_out_target
 
     if f_lo * f_hi > 0:
         raise BVPNotBracketedError(
@@ -784,7 +794,11 @@ def _mode3_brentq(
     the infeasibility scope.
     """
     if P_in_bracket is None:
-        P_in_lo, P_in_hi = P_out_target * 1.01, P_out_target * 100.0
+        # Default upper bound at 10×P_out — wide enough for typical flows
+        # without pushing the chain march into EOS-out-of-range / device
+        # over-choke at extreme stagnation. Walk-down below handles the
+        # edge case where this still lands in an infeasible probe region.
+        P_in_lo, P_in_hi = P_out_target * 1.01, P_out_target * 10.0
     else:
         P_in_lo, P_in_hi = P_in_bracket
 
@@ -818,23 +832,43 @@ def _mode3_brentq(
             # valid region. Treat as choked-equivalent for bracket purposes.
             return _CHOKED_SENTINEL
 
-    # Phase 1: ensure f_hi > 0 (P_in_hi above target). Extend upward if not.
+    # Phase 1: establish a finite-valid P_in_hi with f_hi > 0.
+    # The initial P_in_hi may land in a region where the chain march
+    # encounters EOS-out-of-range (extreme stagnation cooling),
+    # over-choked devices at huge P_stag, or pipe Fanno chokes.
+    # Walk P_in_hi DOWN geometrically until a valid probe is found.
     f_hi = _obj(P_in_hi)
-    if f_hi == _CHOKED_SENTINEL:
-        # Even the highest P_in tried chokes — Mode 3 infeasible.
-        _raise_mode3_infeasible(mdot, P_in_lo, P_in_hi, last_choke)
-    while f_hi < 0:
-        P_in_hi *= 3.0
+    n_walk_down = 0
+    while f_hi == _CHOKED_SENTINEL and n_walk_down < 30:
+        P_in_hi = math.sqrt(max(P_in_lo, 1.0) * P_in_hi)
+        if P_in_hi < P_in_lo * 1.001:
+            break
         f_hi = _obj(P_in_hi)
-        if P_in_hi > 1000.0 * P_out_target:
+        n_walk_down += 1
+    if f_hi == _CHOKED_SENTINEL:
+        _raise_mode3_infeasible(mdot, P_in_lo, P_in_hi, last_choke)
+
+    # If the (now finite-valid) P_in_hi is still below the target,
+    # extend upward cautiously, backing off if extension lands in
+    # another sentinel band.
+    while f_hi < 0:
+        P_in_hi_new = P_in_hi * 3.0
+        if P_in_hi_new > 1000.0 * P_out_target:
             raise BVPNotBracketedError(
                 f"Mode 3: P_out_target={P_out_target/1e5:.3f} bara "
                 f"unreachable even at P_in={P_in_hi/1e5:.3f} bara."
             )
-        if f_hi == _CHOKED_SENTINEL:
-            # Walked up into a choke band — should not happen for monotone
-            # geometry but handle defensively.
-            _raise_mode3_infeasible(mdot, P_in_lo, P_in_hi, last_choke)
+        f_new = _obj(P_in_hi_new)
+        if f_new == _CHOKED_SENTINEL:
+            # Extension hit an infeasible band — stop here with last valid hi
+            break
+        P_in_hi = P_in_hi_new
+        f_hi = f_new
+    if f_hi < 0:
+        raise BVPNotBracketedError(
+            f"Mode 3: cannot extend P_in_hi above target; "
+            f"f({P_in_hi/1e5:.3f}b)={f_hi:.1f}"
+        )
 
     # Phase 2: narrow toward the choke boundary by geometric-mean bisection.
     # Maintain (P_in_lo, P_in_hi) such that f(P_in_lo) is sentinel or negative
