@@ -1100,6 +1100,19 @@ class TabulatedFluid:
     def is_mixture(self) -> bool:
         return self._base.is_mixture
 
+    @property
+    def base_fluid(self) -> "GERGFluid":
+        """Underlying direct-EOS fluid backing this table.
+
+        Exposed so chain-level callers (``solve_chain``) can route HEM
+        throat solves and isentropic flashes through ``GERGFluid``
+        directly while continuing to use the table for per-segment pipe
+        marches. HEM is a 1-D isentrope traversal; the table's 2-D
+        ``(P, T)`` grid offers no benefit there and would mislead
+        callers about what's actually being computed.
+        """
+        return self._base
+
     def table_stats(self) -> dict[str, int | float]:
         """Diagnostics: grid size, failure counts, fallback counts."""
         return {

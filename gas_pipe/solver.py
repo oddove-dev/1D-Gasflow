@@ -573,7 +573,7 @@ def march_ivp(
 # BVP solver
 # ---------------------------------------------------------------------------
 
-def solve_for_mdot(
+def _bvp_single_pipe_mdot(
     pipe: "Pipe",
     fluid: "FluidEOSBase",
     P_in: float,
@@ -860,6 +860,58 @@ def solve_for_mdot(
 
     _report("finalizing", 1.0)
     return _annotate_eos(result)
+
+
+def solve_for_mdot(
+    pipe: "Pipe",
+    fluid: "FluidEOSBase",
+    P_in: float,
+    T_in: float,
+    P_out: float,
+    **kwargs,
+) -> "PipeResult":
+    """Find mass flow rate such that march_ivp gives the target outlet pressure.
+
+    Thin wrapper that builds a single-element :class:`ChainSpec` around
+    ``pipe`` and delegates to :func:`solve_chain` in Mode 1. The chain
+    solver in turn routes single-pipe Mode 1 to the legacy
+    :func:`_bvp_single_pipe_mdot` body so the bracket heuristics and
+    ``_find_critical_mdot`` choke handling that existing tests rely on
+    are preserved exactly.
+
+    Parameters
+    ----------
+    pipe, fluid, P_in, T_in, P_out : as before.
+    ``**kwargs`` : forwarded to :func:`solve_chain`, including
+        ``mdot_bracket``, ``rtol``, ``eos_mode``, ``table_n_P``,
+        ``table_n_T``, ``progress_callback``, ``cancel_event``, and any
+        ``march_ivp`` kwargs.
+
+    Returns
+    -------
+    PipeResult
+        Identical shape to before — the chain solver returns a
+        :class:`ChainResult` whose ``results[0]`` is the
+        :class:`PipeResult` for the wrapped pipe.
+
+    Raises
+    ------
+    Same as :func:`_bvp_single_pipe_mdot` (``BVPChoked``,
+    ``BVPNotBracketedError``, ``IntegrationCapExceeded``,
+    ``SolverCancelled``).
+    """
+    from .chain import ChainSpec, solve_chain
+
+    chain = ChainSpec(elements=[pipe])
+    chain_result = solve_chain(
+        chain,
+        fluid,
+        T_in=T_in,
+        P_in=P_in,
+        P_out=P_out,
+        **kwargs,
+    )
+    return chain_result.results[0]
 
 
 def verify_eos_accuracy(
