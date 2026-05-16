@@ -725,49 +725,165 @@ def _mode1_brentq(
     # _bvp_single_pipe_mdot pattern).
     if f_hi == _CHOKED_SENTINEL:
         if f_lo == _CHOKED_SENTINEL:
-            # Entire bracket is choked — infeasible at any probed mdot.
-            raise BVPChoked(
-                "Chain choked throughout the mdot bracket; "
-                f"no feasible mdot in [{mdot_lo:.3f}, {mdot_hi:.3f}] kg/s.",
-                mdot_critical=mdot_lo,
-                result=last_good or _build_minimal_choked_result(
-                    chain, P_in, T_in, mdot_lo,
-                    boundary_conditions, solver_options, t0,
-                    last_choke_diag,
-                ),
-            )
-        # Bisect to find mdot_critical between mdot_lo (good) and mdot_hi (choked)
-        m_lo, m_hi = mdot_lo, mdot_hi
-        for _ in range(40):
-            m_mid = 0.5 * (m_lo + m_hi)
-            if (m_hi - m_lo) < max(rtol * m_hi, 1e-6):
-                break
-            f_mid = _obj(m_mid)
-            if f_mid == _CHOKED_SENTINEL:
-                m_hi = m_mid
-            else:
-                m_lo = m_mid
-        mdot_critical = m_lo
-        r_crit = _march(mdot_critical)
-        P_last_cell_crit = r_crit.P_last_cell
+            # Both endpoints sentinel — typically the Device-bottleneck
+            # regime: the AGA estimator (fed only the first pipe)
+            # over-estimated mdot, so every initial probe exceeded the
+            # device's HEM choke ceiling and the walk-up-when-choked
+            # loop inverted the bracket. Recovery:
+            #   1. Walk mdot down geometrically to find ANY feasible
+            #      probe (sub-ceiling) → populates ``last_good`` via the
+            #      nonlocal closure in ``_obj``.
+            #   2. Read the chain choke ceiling from ``last_choke_diag``
+            #      (device max_mdot) so we know the upper bound on
+            #      attainable mdot.
+            #   3. March at just-below the ceiling for the canonical
+            #      choke-limited profile.
+            #   4. Decide reachability of ``P_last_cell_target``
+            #      symmetrically with the Fanno-bottleneck else-branch
+            #      below.
+            mdot_floor = max(mdot_hi * 1e-6, 1e-12)
+            mdot_try = min(mdot_lo, mdot_hi)
+            for _ in range(20):
+                mdot_try *= 0.3
+                if mdot_try < mdot_floor:
+                    break
+                _obj(mdot_try)  # side effect: updates last_good
+                if last_good is not None:
+                    break
 
-        if P_last_cell_crit > P_last_cell_target * (1.0 + rtol):
-            # At choke-limited mdot, P_last_cell is still above target →
-            # target is below the choke-limited minimum and cannot be reached.
-            r_crit.choked = True
-            r_crit.choke_diagnostics = last_choke_diag or {"kind": "boundary"}
-            raise BVPChoked(
-                f"Chain choked at mdot_critical={mdot_critical:.4f} kg/s; "
-                f"target P_last_cell={P_last_cell_target/1e5:.3f} bara is "
-                f"unreachable. Choke diagnostic: {last_choke_diag}",
-                mdot_critical=mdot_critical,
-                result=r_crit,
-            )
+            if last_good is None:
+                # Chain genuinely infeasible at every probed mdot down
+                # to the floor — no useful witness available. Fall back
+                # to the minimal NaN result so the caller still gets a
+                # consistent BVPChoked payload.
+                raise BVPChoked(
+                    "Chain choked throughout the mdot bracket and walk-"
+                    "down; no feasible mdot in "
+                    f"[{mdot_floor:.3e}, {mdot_hi:.3f}] kg/s.",
+                    mdot_critical=mdot_lo,
+                    result=_build_minimal_choked_result(
+                        chain, P_in, T_in, mdot_lo,
+                        boundary_conditions, solver_options, t0,
+                        last_choke_diag,
+                    ),
+                )
 
-        # Target IS reachable below mdot_critical — tighten the upper
-        # bracket and continue with brentq on the smooth branch.
-        mdot_hi = mdot_critical
-        f_hi = P_last_cell_crit - P_last_cell_target
+            # Walk-down found a feasible probe. Resolve the chain's
+            # choke ceiling: prefer the device's ``max_mdot`` when the
+            # diagnostic is populated (the common Device-bottleneck
+            # case); fall back to the last sentinel mdot we saw.
+            mdot_ceiling: float | None = None
+            if last_choke_diag is not None:
+                max_mdot_val = last_choke_diag.get("max_mdot")
+                if (
+                    isinstance(max_mdot_val, (int, float))
+                    and math.isfinite(max_mdot_val)
+                    and max_mdot_val > last_good_mdot
+                ):
+                    mdot_ceiling = float(max_mdot_val)
+            if mdot_ceiling is None:
+                # Witness-only fallback: no clean ceiling estimate
+                # available. Treat as device-bottleneck-with-unknown-
+                # ceiling and use the walk-down probe as the choke
+                # witness so the caller still gets a populated result.
+                if last_good.choke_diagnostics is None:
+                    last_good.choke_diagnostics = last_choke_diag
+                raise BVPChoked(
+                    "Chain choke-limited; no resolvable choke ceiling. "
+                    f"Walk-down probe at mdot={last_good_mdot:.4f} kg/s "
+                    "used as the choke witness; target P_last_cell="
+                    f"{P_last_cell_target/1e5:.3f} bara assumed "
+                    "unreachable.",
+                    mdot_critical=last_good_mdot,
+                    result=last_good,
+                )
+
+            # March at just-below the ceiling for the canonical
+            # choke-limited profile. mdot_ceiling * (1 - 1e-3) sits
+            # inside _device_solve_at_mdot's "just-choked" branch
+            # (rel_tol = 1e-4), so the device throat uses the choke
+            # probe directly — clean march, no inner brent.
+            mdot_at_ceiling = mdot_ceiling * (1.0 - 1e-3)
+            try:
+                r_ceiling = _march(mdot_at_ceiling)
+            except (
+                OverChokedError, ChokeReached, SegmentConvergenceError,
+                EOSOutOfRange, EOSTwoPhase, HEMConsistencyError,
+            ):
+                # Ceiling-1e-3 still chokes the chain (e.g. residual
+                # tolerance mismatch). Use the walk-down probe as the
+                # choke witness.
+                if last_good.choke_diagnostics is None:
+                    last_good.choke_diagnostics = last_choke_diag
+                raise BVPChoked(
+                    "Chain choke-limited; canonical ceiling march "
+                    f"failed at mdot={mdot_at_ceiling:.4f} kg/s. "
+                    "Walk-down probe used as the witness.",
+                    mdot_critical=mdot_ceiling,
+                    result=last_good,
+                )
+
+            if r_ceiling.P_last_cell > P_last_cell_target * (1.0 + rtol):
+                # Even at the choke ceiling, P_last_cell exceeds the
+                # target — BC unreachable. Mirrors the analogous
+                # check in _bvp_single_pipe_mdot at the choke-limited
+                # outlet pressure.
+                r_ceiling.choked = True
+                if r_ceiling.choke_diagnostics is None:
+                    r_ceiling.choke_diagnostics = last_choke_diag
+                raise BVPChoked(
+                    f"Chain choke-limited at mdot_critical="
+                    f"{mdot_ceiling:.4f} kg/s; target P_last_cell="
+                    f"{P_last_cell_target/1e5:.3f} bara is unreachable "
+                    "(lowest achievable P_last_cell="
+                    f"{r_ceiling.P_last_cell/1e5:.3f} bara). "
+                    f"Choke diagnostic: {last_choke_diag}",
+                    mdot_critical=mdot_ceiling,
+                    result=r_ceiling,
+                )
+
+            # Target IS reachable in (last_good_mdot, mdot_at_ceiling).
+            # Tighten the bracket and fall through to the main brentq.
+            mdot_lo = last_good_mdot
+            mdot_hi = mdot_at_ceiling
+            f_lo = last_good.P_last_cell - P_last_cell_target
+            f_hi = r_ceiling.P_last_cell - P_last_cell_target
+
+        else:
+            # Fanno-bottleneck path: f_hi sentinel, f_lo non-sentinel.
+            # Bisect to find mdot_critical between mdot_lo (good) and
+            # mdot_hi (choked).
+            m_lo, m_hi = mdot_lo, mdot_hi
+            for _ in range(40):
+                m_mid = 0.5 * (m_lo + m_hi)
+                if (m_hi - m_lo) < max(rtol * m_hi, 1e-6):
+                    break
+                f_mid = _obj(m_mid)
+                if f_mid == _CHOKED_SENTINEL:
+                    m_hi = m_mid
+                else:
+                    m_lo = m_mid
+            mdot_critical = m_lo
+            r_crit = _march(mdot_critical)
+            P_last_cell_crit = r_crit.P_last_cell
+
+            if P_last_cell_crit > P_last_cell_target * (1.0 + rtol):
+                # At choke-limited mdot, P_last_cell is still above target →
+                # target is below the choke-limited minimum and cannot be reached.
+                r_crit.choked = True
+                r_crit.choke_diagnostics = last_choke_diag or {"kind": "boundary"}
+                raise BVPChoked(
+                    f"Chain choked at mdot_critical={mdot_critical:.4f} kg/s; "
+                    f"target P_last_cell={P_last_cell_target/1e5:.3f} bara is "
+                    f"unreachable. Choke diagnostic: {last_choke_diag}",
+                    mdot_critical=mdot_critical,
+                    result=r_crit,
+                )
+
+            # Target IS reachable below mdot_critical — tighten the upper
+            # bracket and continue with brentq on the smooth branch.
+            mdot_hi = mdot_critical
+            f_hi = P_last_cell_crit - P_last_cell_target
 
     if f_lo * f_hi > 0:
         raise BVPNotBracketedError(

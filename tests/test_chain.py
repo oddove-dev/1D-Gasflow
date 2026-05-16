@@ -17,6 +17,8 @@ Covers six categories:
 """
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from gas_pipe import (
@@ -290,25 +292,159 @@ class TestSinglePipeRegression:
         )
 
 
-@pytest.mark.xfail(
-    reason="malformed multi-element BVPChoked result; "
-    "under investigation in post-rename hotfix",
-    strict=True,
-)
 def test_multi_element_bvpchoked_carries_populated_chainresult() -> None:
-    """User-discovered: Pipe → Device → Pipe at infeasible BCs yields a
-    :class:`BVPChoked` whose ``result`` is a ``ChainResult`` with
-    ``results=[]``, 0 pipes / 0 devices reported, NaN ``P_last_cell`` /
-    ``T_out``, and an implausible ``mdot`` (~4868 kg/s for an
-    ``A_vc=70 mm²`` orifice that should limit to well under 1 kg/s).
+    """User-discovered: Pipe → Device → Pipe at infeasible BCs must yield
+    a :class:`BVPChoked` whose ``result`` is the canonical choke-limited
+    march (i.e. ``P_last_cell`` at the device-choke ceiling, ABOVE the
+    user's target).
 
-    Expected (after fix): ``exc.result`` is a ``ChainResult`` with at
-    least one populated element (the choked Pipe 1, carrying its real
-    profile) and a physically plausible ``mdot`` matching the
-    choke-limited value.
+    Pre-fix symptom: ``BVPChoked.result.results == []`` with NaN
+    ``P_last_cell`` / ``T_out`` and ``mdot_critical`` reported as
+    ~4868 kg/s for an orifice that physically limits to sub-kg/s.
 
-    Marked ``xfail(strict=True)`` so that fixing the bug auto-fails the
-    test, prompting removal of the marker in the fix commit.
+    Post-fix expectation: the device-bottleneck recovery in
+    :func:`_mode1_brentq` walks down to find a feasible probe, marches
+    once at just-below the device's ``max_mdot`` ceiling for the
+    canonical choke-limited profile, and raises ``BVPChoked`` carrying
+    that profile when the target is below the ceiling-limited
+    ``P_last_cell``. ``mdot_critical`` equals the device ceiling and
+    ``result.P_last_cell`` is the (finite) lowest-achievable last-cell
+    pressure, which is strictly greater than the user-requested target.
+    """
+    import numpy as np
+    from gas_pipe.chain import ChainResult
+    from gas_pipe.results import PipeResult
+
+    fluid = GERGFluid({"Methane": 1.0})
+    pipe_up = Pipe(sections=[PipeSection(
+        length=80.0, inner_diameter=0.762, roughness=4.5e-5,
+    )])
+    device = Device(A_geom=100e-6, Cd=0.7, name="V-orifice")
+    pipe_down = Pipe(sections=[PipeSection(
+        length=10.0, inner_diameter=0.4, roughness=4.5e-5,
+    )])
+    chain = ChainSpec(elements=[pipe_up, device, pipe_down])
+
+    target = 2e5  # 2 bara — below the device choke-limited P_last_cell
+    with pytest.raises(BVPChoked) as excinfo:
+        solve_chain(
+            chain, fluid, T_in=373.15,
+            P_in=50e5, P_last_cell=target,
+            eos_mode="direct",
+        )
+
+    exc = excinfo.value
+    assert isinstance(exc.result, ChainResult), (
+        f"BVPChoked.result must be ChainResult; "
+        f"got {type(exc.result).__name__}"
+    )
+    assert len(exc.result.results) >= 1, (
+        "ChainResult.results is empty; expected at least pipe 1's "
+        "real march profile from the canonical ceiling march."
+    )
+    first = exc.result.results[0]
+    assert isinstance(first, PipeResult), (
+        f"First chain element should be a PipeResult; "
+        f"got {type(first).__name__}"
+    )
+    assert np.all(np.isfinite(first.P)) and np.all(np.isfinite(first.T)), (
+        "Pipe 1's P / T arrays carry NaNs; the canonical ceiling "
+        "march should produce a clean profile."
+    )
+    # Headline check: the result must show the actual lowest-attainable
+    # P_last_cell (above the user target, since the target is unreachable).
+    assert math.isfinite(exc.result.P_last_cell), (
+        f"ChainResult.P_last_cell={exc.result.P_last_cell!r} is non-"
+        "finite; expected the canonical ceiling-limited last-cell "
+        "pressure."
+    )
+    assert exc.result.P_last_cell > target, (
+        f"ChainResult.P_last_cell={exc.result.P_last_cell/1e5:.3f} bara "
+        f"is at-or-below target {target/1e5:.3f} bara — that would mean "
+        "the BC IS reachable and BVPChoked should not have been raised."
+    )
+    # mdot_critical should equal the device's HEM ceiling.
+    assert 0.0 < exc.mdot_critical < 10.0, (
+        f"mdot_critical = {exc.mdot_critical:.3f} kg/s is out of range; "
+        "expected sub-kg/s order matching the device's HEM choke "
+        "ceiling."
+    )
+    diag = exc.result.choke_diagnostics
+    assert diag is not None, (
+        "ChainResult.choke_diagnostics must be populated so callers "
+        "can identify the bottleneck."
+    )
+    assert diag["kind"] == "device_over_choked", (
+        f"choke_diagnostics.kind = {diag['kind']!r}; "
+        "expected 'device_over_choked' since the device is the "
+        "choke bottleneck."
+    )
+    assert isinstance(diag["element_index"], int)
+    assert diag["element_name"] == "V-orifice"
+    assert diag["max_mdot"] > 0.0
+    # mdot_critical should match the device's HEM ceiling within
+    # numerical tolerance.
+    assert exc.mdot_critical == pytest.approx(diag["max_mdot"], rel=1e-2)
+
+
+def test_multi_element_bvpchoked_distinct_geometry() -> None:
+    """Same device-bottleneck pattern at a different geometry scale.
+
+    Guards against the recovery being too narrowly tuned to the
+    user-discovered repro case. Smaller upstream pipe, smaller device,
+    different BCs — same expected behaviour.
+    """
+    import numpy as np
+    from gas_pipe.chain import ChainResult
+    from gas_pipe.results import PipeResult
+
+    fluid = GERGFluid({"Methane": 1.0})
+    pipe_up = Pipe(sections=[PipeSection(
+        length=40.0, inner_diameter=0.5, roughness=4.5e-5,
+    )])
+    device = Device(A_geom=50e-6, Cd=0.62, name="V-small")
+    pipe_down = Pipe(sections=[PipeSection(
+        length=5.0, inner_diameter=0.2, roughness=4.5e-5,
+    )])
+    chain = ChainSpec(elements=[pipe_up, device, pipe_down])
+
+    target = 1e5
+    with pytest.raises(BVPChoked) as excinfo:
+        solve_chain(
+            chain, fluid, T_in=320.0,
+            P_in=30e5, P_last_cell=target,
+            eos_mode="direct",
+        )
+
+    exc = excinfo.value
+    assert isinstance(exc.result, ChainResult)
+    assert len(exc.result.results) >= 1
+    first = exc.result.results[0]
+    assert isinstance(first, PipeResult)
+    assert np.all(np.isfinite(first.P))
+    assert math.isfinite(exc.result.P_last_cell)
+    assert exc.result.P_last_cell > target
+    assert 0.0 < exc.mdot_critical < 10.0
+    diag = exc.result.choke_diagnostics
+    assert diag is not None
+    assert diag["kind"] == "device_over_choked"
+    assert diag["element_name"] == "V-small"
+    assert exc.mdot_critical == pytest.approx(diag["max_mdot"], rel=1e-2)
+
+
+def test_multi_element_target_above_choke_ceiling_solves() -> None:
+    """Device-bottleneck regime with a reachable target.
+
+    Same geometry as the user-discovered repro, but the target
+    ``P_last_cell`` sits ABOVE the choke-limited last-cell pressure —
+    i.e. inside the feasible mdot range ``(0, mdot_ceiling]``. The
+    solver should return a normal :class:`ChainResult` (not raise
+    ``BVPChoked``) with ``P_last_cell`` matching the target.
+
+    Confirms that the bracket-tightening fall-through after the
+    reachability check actually works — without this test, the
+    ``unreachable`` branch could be tightened without anyone noticing
+    that the ``reachable`` branch had broken.
     """
     from gas_pipe.chain import ChainResult
 
@@ -322,31 +458,27 @@ def test_multi_element_bvpchoked_carries_populated_chainresult() -> None:
     )])
     chain = ChainSpec(elements=[pipe_up, device, pipe_down])
 
-    # Either BVPChoked (preferred — the chain *is* over-constrained at
-    # these BCs) or OverChokedError (if the device choke surfaces before
-    # the Mode 1 bracket walks low enough) is an acceptable raise.
-    # The contract this test enforces is on the BVPChoked.result payload
-    # shape, so we only catch BVPChoked here; an OverChokedError raise
-    # would skip the assertions (still xfail because nothing was raised
-    # of the expected type).
-    with pytest.raises(BVPChoked) as excinfo:
-        solve_chain(
-            chain, fluid, T_in=373.15,
-            P_in=50e5, P_last_cell=2e5,
-            eos_mode="direct",
-        )
+    # Pick a target between the chain's choke-limited P_last_cell
+    # (~25 bara) and the inlet (50 bara). 40 bara is comfortably in
+    # the feasible region.
+    target = 40e5
+    result = solve_chain(
+        chain, fluid, T_in=373.15,
+        P_in=50e5, P_last_cell=target,
+        eos_mode="direct",
+    )
 
-    exc = excinfo.value
-    assert isinstance(exc.result, ChainResult), (
-        f"BVPChoked.result must be ChainResult; "
-        f"got {type(exc.result).__name__}"
+    assert isinstance(result, ChainResult)
+    assert not result.choked, (
+        "Chain reports choked=True despite the target being above "
+        "the choke ceiling; subsonic solution expected."
     )
-    # The bug: results=[] with all-NaN aggregate fields.
-    assert len(exc.result.results) >= 1, (
-        f"ChainResult.results is empty; expected at least the choked "
-        f"Pipe 1 carrying a real march profile."
+    assert result.P_last_cell == pytest.approx(target, rel=1e-3), (
+        f"Solver returned P_last_cell={result.P_last_cell/1e5:.3f} "
+        f"bara, expected {target/1e5:.3f} bara within 0.1%."
     )
-    assert exc.mdot_critical < 100.0, (
-        f"mdot_critical = {exc.mdot_critical:.1f} kg/s is implausibly "
-        "high for a 100 mm² Cd=0.7 orifice; expected sub-kg/s order."
-    )
+    assert result.mdot > 0.0
+    # mdot should be below the device's HEM ceiling (subsonic regime).
+    # We don't know the exact ceiling here without an independent
+    # probe, but sub-kg/s is consistent with a 100 mm² orifice.
+    assert result.mdot < 1.0
