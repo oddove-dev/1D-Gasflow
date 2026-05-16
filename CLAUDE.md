@@ -103,6 +103,20 @@ last elements are Pipes. Device-first and Device-last chains require
 additional solver work (stagnation-as-``P_in``; Borda-Carnot to chain
 outlet) — both in the Roadmap.
 
+Backward march for choked-device downstream pipes: when a device chokes
+mid-chain in Mode 1, pipes downstream of the choke point are marched
+BACKWARD from the ``P_last_cell`` BC toward the choked-device
+transition. The downstream pipe's ``P_first_cell`` is *computed*
+(typically close to ``P_last_cell`` when downstream friction is low),
+not derived from the Borda-Carnot transition. This satisfies the chain
+BC exactly while respecting the device-imposed ``mdot`` ceiling. The
+Borda-Carnot transition predicted by ``DeviceResult.transition`` stays
+attached as a diagnostic of what *would have* been the downstream
+pipe's inlet had the BC not constrained it. v1 requires downstream
+pipes to be adiabatic (``overall_U == 0``); diabatic downstream raises
+``BackwardMarchDiabaticNotSupported``. The diabatic extension would
+need a forward-T-backward-P iteration that is not yet in scope.
+
 ## Architecture
 
 ### EOS evaluation
@@ -222,6 +236,17 @@ trip over:
   the exception carries a fully-populated `PipeResult` at ṁ_critical
   (or `ChainResult` when raised by `solve_chain` directly — see the
   uniform-payload contract in `chain.py`).
+- **Backward-march trigger tolerance.** The `mdot_ceiling` refinement
+  bisect in `_mode1_brentq` resolves the operating-regime choke
+  boundary to ~1e-4 relative accuracy. Below that, the re-march at
+  `0.999 · mdot_ceiling` may not land inside
+  `_device_solve_at_mdot`'s just-choked window (`rel_tol = 1e-4`), so
+  `throat.choked` can stay `False` even when the device is
+  operationally at choke. The backward-mode trigger therefore gates
+  on `throat.choked or throat.M >= 0.95` — the `M >= 0.95` clause is
+  the numerical-noise buffer at the converged operating ceiling, not
+  a softening of the physical "device is choked" assertion. Don't
+  tighten this threshold without also tightening the bisect.
 
 ## Validation status
 

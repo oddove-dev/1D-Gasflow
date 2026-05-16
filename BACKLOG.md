@@ -156,6 +156,22 @@ Sequence (remaining; Item numbers assigned at implementation start):
 
 ## Done
 
+- **2026-05-16**: Backward march for pipes downstream of device choke —
+  chain solver now respects `P_last_cell` BC when a device chokes
+  mid-chain. The downstream pipe is marched backward from the chain
+  BC via the adiabatic `h_stag` invariant, decoupling its
+  `P_first_cell` from the Borda-Carnot transition (which stays
+  attached to `DeviceResult.transition` as a diagnostic). v1 scope:
+  single choked device, Mode 1 only, adiabatic downstream
+  (`overall_U == 0`); diabatic downstream raises
+  `BackwardMarchDiabaticNotSupported`. Integration includes a bisect
+  refinement of the operating-regime choke ceiling (so `U > 0` on
+  Pipe 1 activates backward mode reliably), the `M >= 0.95`
+  numerical-noise buffer on the trigger, GUI `CHOKE DIAGNOSTIC`
+  block (replaces the raw dict-repr), and three regression tests in
+  `tests/test_chain.py` (adiabatic + U > 0 + diabatic guard). Two
+  commits: backward primitives (`7aa2237`), integration + GUI +
+  bisect refinement + diagnostic formatter (`f178c00`).
 - **2026-05-16**: Pressure terminology hotfix — rename `P_out` →
   `P_last_cell` across `chain.py`, `solver.py`, `eos.py`, `errors.py`,
   `diagnostics.py`, `gui.py`, and tests; reserve the `P_out` name for a
@@ -181,7 +197,7 @@ Sequence (remaining; Item numbers assigned at implementation start):
   `TabulatedFluid.base_fluid` accessor added so chain code routes HEM
   through `GERGFluid` while keeping pipe march on the table. Second
   item of the AIV / HEM-source sequence. Three commits: scaffolding
-  (`69fc758`), implementation (`feacc77`), tests (this commit).
+  (`69fc758`), implementation (`feacc77`), tests (`fbf56af`).
 - **2026-05-14**: Item 3 — HEM throat solver core (`GERGFluid.hem_throat`,
   `props_Ps_via_jt`). Bounded-Brent G_max maximization on the (P_t, s_stag)
   isentrope; `ThroatState` with all fields populated for both `A_vc` and

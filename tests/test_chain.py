@@ -461,3 +461,99 @@ def test_multi_element_target_above_choke_ceiling_solves() -> None:
     # We don't know the exact ceiling here without an independent
     # probe, but sub-kg/s is consistent with a 100 mm² orifice.
     assert result.mdot < 1.0
+    # Backward mode must NOT activate in the subcritical regime:
+    # pipe 2 stays forward-marched from the device's Borda-Carnot
+    # transition, and no choke_diagnostics dict is attached.
+    from gas_pipe.results import PipeResult
+    pipe2 = result.results[2]
+    assert isinstance(pipe2, PipeResult)
+    assert pipe2.march_direction == "forward"
+    assert result.choke_diagnostics is None
+
+
+def test_multi_element_choked_device_diabatic_upstream_backward_pipe2() -> None:
+    """Bisect-refined ceiling: U > 0 on Pipe 1 must still activate
+    backward downstream march.
+
+    Regression for the bisect refinement landed in chain.py: with U > 0
+    cooling Pipe 1, ``state_up`` at the device shifts across mdot
+    probes, so the walk-down's ``last_choke_diag.max_mdot`` lies
+    below the device's true ``mdot_max`` at the operating regime. The
+    pre-bisect path resolved ``mdot_at_ceiling`` outside the device's
+    just-choked tolerance window, ``throat.choked`` stayed False, and
+    backward mode silently bypassed back to Borda-Carnot forward.
+
+    With the bisect refinement, the operating-regime choke ceiling is
+    resolved to ~1e-4 relative accuracy; the re-march at 0.999 ×
+    ceiling lands inside the device's just-choked window, and the
+    ``M >= 0.95`` backward-mode trigger fires. The downstream pipe
+    backward-marches from the chain BC.
+    """
+    import numpy as np
+    from gas_pipe.chain import ChainResult
+    from gas_pipe.results import PipeResult
+
+    fluid = GERGFluid({"Methane": 1.0})
+    pipe_up = Pipe(sections=[PipeSection(
+        length=80.0, inner_diameter=0.762, roughness=4.5e-5,
+        overall_U=2.0,
+    )], ambient_temperature=288.15)
+    device = Device(A_geom=100e-6, Cd=0.7, name="V-orifice")
+    pipe_down = Pipe(sections=[PipeSection(
+        length=10.0, inner_diameter=0.4, roughness=4.5e-5,
+    )])
+    chain = ChainSpec(elements=[pipe_up, device, pipe_down])
+
+    target = 2e5
+    result = solve_chain(
+        chain, fluid, T_in=373.15,
+        P_in=50e5, P_last_cell=target,
+        eos_mode="direct",
+    )
+
+    assert isinstance(result, ChainResult)
+    assert result.choked is True
+    assert result.P_last_cell == pytest.approx(target, abs=200.0)
+    pipe2 = result.results[2]
+    assert isinstance(pipe2, PipeResult)
+    assert pipe2.march_direction == "backward"
+    assert np.all(np.isfinite(pipe2.P))
+    assert pipe2.P[-1] == pytest.approx(target, abs=200.0)
+    diag = result.choke_diagnostics
+    assert diag is not None
+    assert diag["kind"] == "device_choke_downstream_backward"
+
+
+def test_multi_element_choked_device_diabatic_downstream_raises() -> None:
+    """Diabatic guard: ``overall_U > 0`` on a pipe downstream of a
+    choked device must raise :class:`BackwardMarchDiabaticNotSupported`.
+
+    The v1 backward march relies on adiabatic ``h_stag`` invariance.
+    Diabatic downstream pipes would need a forward-T-backward-P
+    iteration that is out of scope. The guard surfaces this clearly
+    rather than silently producing a wrong result.
+    """
+    from gas_pipe.errors import BackwardMarchDiabaticNotSupported
+
+    fluid = GERGFluid({"Methane": 1.0})
+    pipe_up = Pipe(sections=[PipeSection(
+        length=80.0, inner_diameter=0.762, roughness=4.5e-5,
+    )])
+    device = Device(A_geom=100e-6, Cd=0.7, name="V-orifice")
+    pipe_down = Pipe(sections=[PipeSection(
+        length=10.0, inner_diameter=0.4, roughness=4.5e-5,
+        overall_U=2.0,
+    )], ambient_temperature=288.15)
+    chain = ChainSpec(elements=[pipe_up, device, pipe_down])
+
+    with pytest.raises(BackwardMarchDiabaticNotSupported) as excinfo:
+        solve_chain(
+            chain, fluid, T_in=373.15,
+            P_in=50e5, P_last_cell=2e5,
+            eos_mode="direct",
+        )
+    msg = str(excinfo.value)
+    # Error must surface the offending chain index and section.
+    assert "chain index 2" in msg
+    assert "section 0" in msg
+    assert "overall_U" in msg
