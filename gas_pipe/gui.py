@@ -194,7 +194,9 @@ _SKARV_BC = {
     "T_in_C": 100.0,
     "mode": "BVP",
     "mdot_kgs": 120.0,
-    "P_out_bara": 2.0,
+    # ``P_last_cell`` is the per-pipe last-cell pressure — not a chain-level
+    # post-expansion BC; see the "Pressure terminology" section of CLAUDE.md.
+    "P_last_cell_bara": 2.0,
 }
 
 _SKARV_SOLVER = {
@@ -319,6 +321,43 @@ def _add_labeled_entry(
     return entry
 
 
+# ----------------------------------------------------------------------
+# Helper: hover tooltip
+# ----------------------------------------------------------------------
+def _make_tooltip(widget: tk.Widget, text: str, wraplength: int = 320) -> None:
+    """Attach a borderless Toplevel that appears on hover.
+
+    Used for expert-knowledge fields where the inline label can't carry
+    the full caveat — e.g. distinguishing per-pipe ``P_last_cell`` from
+    a future chain-level post-expansion ``P_out`` BC.
+    """
+    tip: list[tk.Toplevel | None] = [None]
+
+    def _show(_event: tk.Event) -> None:
+        if tip[0] is not None:
+            return
+        top = tk.Toplevel(widget)
+        top.wm_overrideredirect(True)
+        x = widget.winfo_rootx() + 16
+        y = widget.winfo_rooty() + widget.winfo_height() + 4
+        top.wm_geometry(f"+{x}+{y}")
+        ttk.Label(
+            top, text=text, wraplength=wraplength, justify="left",
+            background="#ffffdd", relief="solid", borderwidth=1,
+            padding=(6, 4),
+        ).pack()
+        tip[0] = top
+
+    def _hide(_event: tk.Event) -> None:
+        if tip[0] is not None:
+            tip[0].destroy()
+            tip[0] = None
+
+    widget.bind("<Enter>", _show)
+    widget.bind("<Leave>", _hide)
+    widget.bind("<ButtonPress>", _hide)
+
+
 # ======================================================================
 # MainWindow
 # ======================================================================
@@ -354,7 +393,11 @@ class MainWindow:
         self.var_T_in = tk.StringVar(value=str(_SKARV_BC["T_in_C"]))
         self.var_mode = tk.StringVar(value=str(_SKARV_BC["mode"]))
         self.var_mdot = tk.StringVar(value=str(_SKARV_BC["mdot_kgs"]))
-        self.var_P_out = tk.StringVar(value=str(_SKARV_BC["P_out_bara"]))
+        # ``P_last_cell`` is the per-pipe last-cell pressure — not a chain-
+        # level post-expansion BC; see CLAUDE.md "Pressure terminology".
+        self.var_P_last_cell = tk.StringVar(
+            value=str(_SKARV_BC["P_last_cell_bara"]),
+        )
         # Solver
         # Discretization: split into adaptive + (linear N or dimensionless α).
         # Only one of n_seg / alpha is meaningful at a time, but we hold both
@@ -999,7 +1042,7 @@ class MainWindow:
             command=self._update_mode_visibility,
         ).pack(side="left", padx=(0, 8))
         ttk.Radiobutton(
-            mode_frame, text="BVP (specify P_out)",
+            mode_frame, text="BVP (specify P_last_cell)",
             variable=self.var_mode, value="BVP",
             command=self._update_mode_visibility,
         ).pack(side="left")
@@ -1011,7 +1054,16 @@ class MainWindow:
 
         self._bvp_frame = ttk.Frame(f)
         self._bvp_frame.columnconfigure(1, weight=1)
-        _add_labeled_entry(self._bvp_frame, 0, "Outlet P [bara]", self.var_P_out, v)
+        e_pipe_end = _add_labeled_entry(
+            self._bvp_frame, 0, "Pipe end P [bara]", self.var_P_last_cell, v,
+        )
+        _make_tooltip(
+            e_pipe_end,
+            "Pressure in the last cell of the last pipe. NOT the "
+            "atmospheric / downstream-of-expansion pressure — the "
+            "post-expansion BC is reserved for a future outlet-expansion "
+            "model and is not yet coupled to the solver.",
+        )
 
         # Place both at the same grid row; visibility toggled in
         # _update_mode_visibility().
@@ -1445,9 +1497,11 @@ class MainWindow:
             )
 
         # Treeview with the spec'd columns.
-        cols = ("P_out", "mdot", "choked", "M_out", "T_out", "x_choke")
+        cols = (
+            "P_last_cell", "mdot", "choked", "M_out", "T_out", "x_choke",
+        )
         headings = {
-            "P_out": "P_out [bara]",
+            "P_last_cell": "P_last_cell [bara]",
             "mdot": "ṁ [kg/s]",
             "choked": "Choked",
             "M_out": "M_out",
@@ -1638,14 +1692,16 @@ class MainWindow:
             raise _InputValidationError(f"Unknown mode {mode!r}.")
         if mode == "IVP":
             mdot = _parse_positive_float(self.var_mdot.get(), "Mass flow")
-            P_out: float | None = None
+            P_last_cell: float | None = None
         else:
-            P_out = _parse_positive_float(self.var_P_out.get(), "Outlet P") * 1e5
+            P_last_cell = _parse_positive_float(
+                self.var_P_last_cell.get(), "Pipe end P"
+            ) * 1e5
             mdot = None
-            if P_out >= P_in:
+            if P_last_cell >= P_in:
                 raise _InputValidationError(
-                    f"Outlet P ({P_out / 1e5:.2f} bara) must be lower than "
-                    f"Inlet P ({P_in / 1e5:.2f} bara)."
+                    f"Pipe end P ({P_last_cell / 1e5:.2f} bara) must be lower "
+                    f"than Inlet P ({P_in / 1e5:.2f} bara)."
                 )
 
         bc = {
@@ -1653,7 +1709,7 @@ class MainWindow:
             "T_in": T_in_K,
             "mode": mode,
             "mdot": mdot,
-            "P_out": P_out,
+            "P_last_cell": P_last_cell,
         }
 
         # Solver options — resolve discretization first since N depends on
@@ -1828,13 +1884,13 @@ class MainWindow:
         discretization = inputs["discretization"]
 
         # Map the legacy GUI BC mode to solve_chain keyword args.
-        # IVP → Mode 2 (P_in + mdot). BVP → Mode 1 (P_in + P_out).
-        # Mode 3 (P_out + mdot) is not yet wired through the GUI — the
+        # IVP → Mode 2 (P_in + mdot). BVP → Mode 1 (P_in + P_last_cell).
+        # Mode 3 (P_last_cell + mdot) is not yet wired through the GUI — the
         # 3-field BC layout that exposes it lands in commit 2.
         if bc["mode"] == "IVP":
             chain_kwargs = {"P_in": bc["P_in"], "mdot": bc["mdot"]}
         else:
-            chain_kwargs = {"P_in": bc["P_in"], "P_out": bc["P_out"]}
+            chain_kwargs = {"P_in": bc["P_in"], "P_last_cell": bc["P_last_cell"]}
 
         first_pipe_D = float(chain.pipes[0].sections[0].inner_diameter)
 
@@ -1884,8 +1940,8 @@ class MainWindow:
     def _action_verify_eos(self) -> None:
         """Run the current BVP case both ways (table vs direct), show deltas.
 
-        Disabled when mode is IVP (no P_out target → no direct-vs-table
-        comparison to run). The verify happens off the Tk thread via the
+        Disabled when mode is IVP (no P_last_cell target → no direct-vs-
+        table comparison to run). The verify happens off the Tk thread via the
         existing SolverWorker so the window stays responsive.
         """
         if self._worker.is_running():
@@ -1926,7 +1982,7 @@ class MainWindow:
 
         def _do_verify() -> dict:
             return verify_eos_accuracy(
-                pipe, fluid, bc["P_in"], bc["T_in"], bc["P_out"],
+                pipe, fluid, bc["P_in"], bc["T_in"], bc["P_last_cell"],
                 cancel_event=self._worker.cancel_event,
                 **table_kwargs, **solver_kwargs,
             )
@@ -1952,7 +2008,7 @@ class MainWindow:
         rel_mdot_pct = report["mdot_rel_diff"] * 100
         verdict_ok = (
             rel_mdot_pct < 0.5
-            and report["P_out_diff_Pa"] < 50e3
+            and report["P_last_cell_diff_Pa"] < 50e3
             and report["T_out_diff_K"] < 1.0
         )
         verdict_text = (
@@ -1978,8 +2034,8 @@ class MainWindow:
              f"{rel_mdot_pct:.3f}%  "
              f"(direct={report['result_direct'].mdot:.2f}, "
              f"table={report['result_table'].mdot:.2f} kg/s)"),
-            ("ΔP_out",
-             f"{report['P_out_diff_Pa']/1e3:.2f} kPa"),
+            ("ΔP_last_cell",
+             f"{report['P_last_cell_diff_Pa']/1e3:.2f} kPa"),
             ("ΔT_out",
              f"{report['T_out_diff_K']:.3f} K"),
             ("Δx_choke",
@@ -2227,7 +2283,7 @@ class MainWindow:
     # Plateau sweep (Phase 15)
     # ------------------------------------------------------------------
     def _action_run_plateau_sweep(self) -> None:
-        """Sweep 8 P_out values from 0.9·P_in to 0.05·P_in (log-spaced)."""
+        """Sweep 8 P_last_cell values from 0.9·P_in to 0.05·P_in (log-spaced)."""
         if self._worker.is_running():
             return
 
@@ -2257,18 +2313,20 @@ class MainWindow:
         discretization = inputs["discretization"]
         D_ref = float(pipe.sections[0].inner_diameter)
 
-        # P_out schedule: 8 points log-spaced from 0.9·P_in to 0.05·P_in.
-        # Order high → low so a true choke plateau appears as a flat tail
-        # of red squares on the right of the (inverted-x) plot.
+        # P_last_cell schedule: 8 points log-spaced from 0.9·P_in to
+        # 0.05·P_in. Order high → low so a true choke plateau appears as
+        # a flat tail of red squares on the right of the (inverted-x) plot.
         from .solver import plateau_sweep
         P_in_val = float(bc["P_in"])
-        P_out_array = np.geomspace(0.9 * P_in_val, 0.05 * P_in_val, 8)
+        P_last_cell_array = np.geomspace(
+            0.9 * P_in_val, 0.05 * P_in_val, 8,
+        )
 
         # Shared progress state — written by the worker thread (only
         # appended-to via the on_point callback, which the worker calls
         # synchronously between points), read by the Tk-side _tick_elapsed.
         self._sweep_partial: list[dict] = []
-        self._sweep_total = len(P_out_array)
+        self._sweep_total = len(P_last_cell_array)
 
         def _on_point(idx_completed: int, total: int, point: dict) -> None:
             # Stamp the discretization choice on each per-point PipeResult
@@ -2282,7 +2340,7 @@ class MainWindow:
 
         def _do_sweep() -> list[dict]:
             return plateau_sweep(
-                pipe, fluid, bc["P_in"], bc["T_in"], P_out_array,
+                pipe, fluid, bc["P_in"], bc["T_in"], P_last_cell_array,
                 ivp_kwargs=solver_kwargs,
                 cancel_event=self._worker.cancel_event,
                 on_point=_on_point,
@@ -2334,10 +2392,12 @@ class MainWindow:
 
         # Plot.
         if plot_ok and self._sweep_figure is not None and self._sweep_canvas is not None:
-            P_out_arr = np.asarray([p["P_out"] for p in points], dtype=float)
+            P_last_cell_arr = np.asarray(
+                [p["P_last_cell"] for p in points], dtype=float,
+            )
             mdot_arr = np.asarray([p["mdot"] for p in points], dtype=float)
             choked_flags = [bool(p["choked"]) for p in points]
-            plot_plateau_sweep(P_out_arr, mdot_arr, choked_flags,
+            plot_plateau_sweep(P_last_cell_arr, mdot_arr, choked_flags,
                                fig=self._sweep_figure)
             self._sweep_canvas.draw()
 
@@ -2347,7 +2407,7 @@ class MainWindow:
             for item in tv.get_children():
                 tv.delete(item)
             for p in points:
-                P_bara = p["P_out"] / 1e5
+                P_bara = p["P_last_cell"] / 1e5
                 if p["error"] is not None:
                     mdot_s = f"err: {p['error'][:30]}"
                     choked_s = "—"
@@ -2418,7 +2478,7 @@ class MainWindow:
             f"{n_devices} device(s).\n"
             f"  mdot = {result.mdot:.4f} kg/s\n"
             f"  P_in = {result.P_in/1e5:.3f} bara → "
-            f"P_out = {result.P_out/1e5:.3f} bara\n"
+            f"P_last_cell = {result.P_last_cell/1e5:.3f} bara\n"
             f"  T_in = {result.T_in-273.15:.2f} °C → "
             f"T_out = {result.T_out-273.15:.2f} °C\n"
             f"  Elapsed: {result.elapsed:.1f} s\n\n"

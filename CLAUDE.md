@@ -59,6 +59,50 @@ FSA/OLGA, not competing with them.
 - Turbulent regime (Colebrook-White friction)
 - Mach range where compressibility matters (typically M > 0.1, up to choke)
 
+## Pressure terminology
+
+The flow has three distinct pressure stations that the code must keep apart:
+
+```
+[upstream source] ─► P_in ─► [pipe model] ─► P_last_cell ─► [free expansion] ─► P_out
+                     ↑                       ↑                                  ↑
+                chain BC          last cell of last pipe              chain BC (future)
+                                  (computed result)                   post-expansion
+```
+
+- **`P_in`** — chain-level upstream BC. Its physical interpretation depends
+  on the first chain element: with a leading Pipe (the only topology
+  ``ChainSpec`` currently allows) it equals ``P_first_cell`` of pipe 1.
+  With a leading Device — future work — it would be stagnation pressure
+  upstream of the device.
+- **`P_first_cell`, `P_last_cell`** — per-pipe internal computed values
+  (first/last cell of a pipe). ``PipeResult`` does not expose them as
+  scalar fields; read them as ``result.P[0]`` and ``result.P[-1]`` or
+  via ``PipeResult.summary()``. ``ChainResult`` exposes
+  ``P_last_cell`` as a top-level field (the last cell of the last pipe).
+- **`P_out`** — *reserved name* for the chain-level downstream BC
+  (post free-jet expansion). Not yet coupled to the solver. The
+  legacy ``ChainResult.P_out`` and ``solve_chain(P_out=…)`` kwarg have
+  been renamed to ``P_last_cell`` — ``ChainResult.P_out`` remains as a
+  ``DeprecationWarning``-raising alias, and ``solve_for_mdot`` keeps a
+  silent ``P_out`` kwarg as a back-compat alias for ``P_last_cell``.
+  See *Roadmap → Outlet expansion model* for the planned coupling.
+- **`P_end`** — deprecated; never use. If you see it in older
+  documentation, it meant ``P_last_cell``.
+
+Why this matters: in a choked flare system the last-cell pressure can
+be 20+ bara while atmospheric ``P_out`` is ~1 bara. Conflating them
+produces silent physical errors. The renamed BC also clarifies that
+specifying ``P_last_cell`` below the choke-limited value is genuinely
+infeasible (you cannot have a last-cell pressure below the choke
+pressure), as distinct from a downstream BC that lies behind a free
+expansion.
+
+Current topology constraint: ``ChainSpec`` validates that the first and
+last elements are Pipes. Device-first and Device-last chains require
+additional solver work (stagnation-as-``P_in``; Borda-Carnot to chain
+outlet) — both in the Roadmap.
+
 ## Architecture
 
 ### EOS evaluation
@@ -174,8 +218,10 @@ trip over:
   pollution because `self` is hashed. Use a per-instance dict instead;
   see `GERGFluid._cache`.
 - **`BVPChoked` is not an error.** It's the normal outcome when the
-  target P_out is below the choke-limited outlet pressure; the exception
-  carries a fully-populated `PipeResult` at ṁ_critical.
+  target `P_last_cell` is below the choke-limited last-cell pressure;
+  the exception carries a fully-populated `PipeResult` at ṁ_critical
+  (or `ChainResult` when raised by `solve_chain` directly — see the
+  uniform-payload contract in `chain.py`).
 
 ## Validation status
 

@@ -166,12 +166,12 @@ def test_estimate_operating_window_skarv_defaults(fluid: GERGFluid):
     that the solver won't go out of grid at typical operating points,
     not to validate the cooling estimate to within K.
     """
-    P_in, T_in, P_out = 50e5, 373.15, 2e5
+    P_in, T_in, P_last_cell = 50e5, 373.15, 2e5
     P_min, P_max, T_min, T_max = estimate_operating_window(
-        P_in, T_in, P_out, fluid
+        P_in, T_in, P_last_cell, fluid
     )
     # Pressure window must include both BCs with the margin factor applied.
-    assert P_min < P_out
+    assert P_min < P_last_cell
     assert P_max > P_in
     # Temperature window must extend at least the T_min_floor below T_in
     # and at least T_max_overhead above.
@@ -239,7 +239,7 @@ def test_solver_with_table_mode_matches_direct_skarv(fluid: GERGFluid):
     # error to accumulate slightly across the march.
     P_diff_kPa = abs(r_table.P[-1] - r_direct.P[-1]) / 1e3
     T_diff_K = abs(r_table.T[-1] - r_direct.T[-1])
-    assert P_diff_kPa < 50.0, f"P_out differs by {P_diff_kPa:.2f} kPa"
+    assert P_diff_kPa < 50.0, f"P_last_cell differs by {P_diff_kPa:.2f} kPa"
     assert T_diff_K < 1.0, f"T_out differs by {T_diff_K:.3f} K"
 
     # The table result must carry the table-mode diagnostics.
@@ -291,7 +291,7 @@ def test_plateau_sweep_builds_table_once(fluid: GERGFluid, monkeypatch):
     monkeypatch is the most direct way to assert "once."
     """
     pipe = Pipe.horizontal_uniform(length=50.0, inner_diameter=0.4)
-    P_out_array = np.array([25e5, 22e5, 18e5])
+    P_last_cell_array = np.array([25e5, 22e5, 18e5])
 
     from gas_pipe import eos as _eos
     from gas_pipe import solver as _solver
@@ -307,7 +307,7 @@ def test_plateau_sweep_builds_table_once(fluid: GERGFluid, monkeypatch):
 
     points = plateau_sweep(
         pipe, fluid, P_in=30e5, T_in=323.15,
-        P_out_array=P_out_array, eos_mode="table",
+        P_last_cell_array=P_last_cell_array, eos_mode="table",
         table_n_P=20, table_n_T=20,
     )
     assert len(points) == 3
@@ -333,7 +333,7 @@ def test_plateau_sweep_direct_mode_builds_no_table(fluid: GERGFluid, monkeypatch
 
     plateau_sweep(
         pipe, fluid, P_in=30e5, T_in=323.15,
-        P_out_array=np.array([25e5, 22e5]), eos_mode="direct",
+        P_last_cell_array=np.array([25e5, 22e5]), eos_mode="direct",
     )
     assert n_builds["count"] == 0
 

@@ -246,7 +246,7 @@ def _aga_estimate_mdot(
     fluid: "FluidEOSBase",
     P_in: float,
     T_in: float,
-    P_out: float,
+    P_last_cell: float,
 ) -> float:
     """AGA fully-turbulent equation for initial ṁ bracket midpoint.
 
@@ -256,7 +256,7 @@ def _aga_estimate_mdot(
     fluid : FluidEOSBase
     P_in : float  [Pa]
     T_in : float  [K]
-    P_out : float [Pa]
+    P_last_cell : float [Pa]
 
     Returns
     -------
@@ -269,7 +269,7 @@ def _aga_estimate_mdot(
     A = pipe.area
 
     # Average state
-    P_avg = 0.5 * (P_in + P_out)
+    P_avg = 0.5 * (P_in + P_last_cell)
     T_avg = T_in  # isothermal approximation
     try:
         state_avg = fluid.props(P_avg, T_avg)
@@ -287,9 +287,15 @@ def _aga_estimate_mdot(
 
     # AGA: P1²-P2² = f * L/D * ρ_avg * u_avg² — simplified
     # P1² - P2² = f * (L/D) * (ṁ/A)² / (2 * ρ_avg)
-    dP_sq = P_in ** 2 - P_out ** 2
+    dP_sq = P_in ** 2 - P_last_cell ** 2
     if dP_sq <= 0:
-        return max(1.0, rho_avg * A * math.sqrt(2 * abs(P_in - P_out) / (rho_avg * f_turb * L / D + 1e-10)))
+        return max(
+            1.0,
+            rho_avg * A * math.sqrt(
+                2 * abs(P_in - P_last_cell)
+                / (rho_avg * f_turb * L / D + 1e-10)
+            ),
+        )
 
     mdot_est = A * math.sqrt(2.0 * rho_avg * dP_sq / (2 * P_avg * f_turb * L / D))
     return max(0.01, mdot_est)
@@ -578,7 +584,7 @@ def _bvp_single_pipe_mdot(
     fluid: "FluidEOSBase",
     P_in: float,
     T_in: float,
-    P_out: float,
+    P_last_cell: float,
     mdot_bracket: tuple[float, float] | None = None,
     rtol: float = 1e-5,
     progress_callback: Callable[[str, float], None] | None = None,
@@ -590,7 +596,7 @@ def _bvp_single_pipe_mdot(
     T_range_override: tuple[float, float] | None = None,
     **ivp_kwargs,
 ) -> "PipeResult":
-    """Find mass flow rate such that march_ivp gives the target outlet pressure.
+    """Find ``mdot`` such that ``march_ivp`` lands at the target last-cell pressure.
 
     Parameters
     ----------
@@ -600,12 +606,14 @@ def _bvp_single_pipe_mdot(
         Inlet pressure [Pa].
     T_in : float
         Inlet temperature [K].
-    P_out : float
-        Target outlet pressure [Pa].
+    P_last_cell : float
+        Target pressure in the last cell of the pipe [Pa]. See CLAUDE.md
+        "Pressure terminology" — this is a computed per-pipe quantity,
+        not the chain-level downstream BC.
     mdot_bracket : tuple or None
         (mdot_lo, mdot_hi) bracket. If None, estimated automatically.
     rtol : float
-        Relative tolerance on P_out match.
+        Relative tolerance on ``P_last_cell`` match.
     progress_callback : Callable or None
         Called as (stage_name, fraction).
     eos_mode : {"table", "direct"}
@@ -634,7 +642,7 @@ def _bvp_single_pipe_mdot(
     BVPChoked
         If the flow chokes before reaching the outlet at all feasible ṁ.
     BVPNotBracketedError
-        If the target P_out cannot be bracketed.
+        If the target ``P_last_cell`` cannot be bracketed.
     """
     t0 = time.time()
 
@@ -656,7 +664,7 @@ def _bvp_single_pipe_mdot(
             P_range, T_range = P_range_override, T_range_override
         else:
             P_min, P_max, T_min, T_max = estimate_operating_window(
-                P_in, T_in, P_out, fluid,
+                P_in, T_in, P_last_cell, fluid,
             )
             P_range = P_range_override if P_range_override is not None else (P_min, P_max)
             T_range = T_range_override if T_range_override is not None else (T_min, T_max)
@@ -708,7 +716,9 @@ def _bvp_single_pipe_mdot(
 
     # Build bracket
     if mdot_bracket is None:
-        mdot_mid = _aga_estimate_mdot(pipe, working_fluid, P_in, T_in, P_out)
+        mdot_mid = _aga_estimate_mdot(
+            pipe, working_fluid, P_in, T_in, P_last_cell,
+        )
         mdot_lo_try = mdot_mid * 0.1
         mdot_hi_try = mdot_mid * 10.0
         # Proactive cap: AGA can be wildly off (30×+) for short or low-loss
@@ -727,9 +737,9 @@ def _bvp_single_pipe_mdot(
 
     _report("bracketing", 0.0)
 
-    # The objective: march_ivp and return (P_out_calc - P_out_target)
+    # The objective: march_ivp and return (P_last_cell_calc - P_last_cell_target)
     # Choked attempts: return a large NEGATIVE sentinel — signals "ṁ is above
-    # critical, must reduce to reach P_out subsonically." This makes the
+    # critical, must reduce to reach the target subsonically." This makes the
     # discontinuity at ṁ_critical a clean sign change so brentq can bracket
     # the subsonic root or land on the choke boundary cleanly.
     _CHOKED_SENTINEL = -1e10
@@ -744,7 +754,7 @@ def _bvp_single_pipe_mdot(
                 last_choked_mdot = mdot
                 return _CHOKED_SENTINEL
             last_successful_mdot = mdot
-            return float(r.P[-1]) - P_out
+            return float(r.P[-1]) - P_last_cell
         except IntegrationCapExceeded:
             # Numerical failure — propagate. Caller surfaces as a real error
             # rather than silently treating as a choke boundary.
@@ -788,7 +798,8 @@ def _bvp_single_pipe_mdot(
         _report("bracketing", 0.8)
         try:
             mdot_crit, r_choked_witness = _find_critical_mdot(
-                pipe, working_fluid, P_in, T_in, P_out, mdot_lo_try, mdot_hi_try,
+                pipe, working_fluid, P_in, T_in, P_last_cell,
+                mdot_lo_try, mdot_hi_try,
                 ivp_kwargs, march_fn=_cached_march
             )
         except Exception as exc:
@@ -800,10 +811,10 @@ def _bvp_single_pipe_mdot(
         # subsonic answer at the choke boundary. _find_critical_mdot
         # already probed this exact mdot, so the cache returns instantly.
         r_crit = _cached_march(mdot_crit)
-        P_out_crit = float(r_crit.P[-1])
+        P_last_cell_crit = float(r_crit.P[-1])
 
-        if P_out_crit > P_out * (1 + rtol):
-            # P_target is below the choke-limited outlet pressure → unreachable.
+        if P_last_cell_crit > P_last_cell * (1 + rtol):
+            # Target is below the choke-limited last-cell pressure → unreachable.
             # Use the fresh r_crit march at ṁ_critical as the canonical result;
             # it's a full subsonic profile. Force choked/x_choke post-hoc since
             # for a constant-area Fanno pipe, max flow chokes at the outlet.
@@ -813,7 +824,8 @@ def _bvp_single_pipe_mdot(
             _annotate_eos(result_to_return)
             raise BVPChoked(
                 f"Flow chokes at ṁ_critical = {mdot_crit:.3f} kg/s; "
-                f"target P_out = {P_out/1e5:.3f} bara is unreachable.",
+                f"target P_last_cell = {P_last_cell/1e5:.3f} bara is "
+                "unreachable.",
                 mdot_critical=mdot_crit,
                 result=result_to_return,
             )
@@ -821,13 +833,13 @@ def _bvp_single_pipe_mdot(
         # Subsonic solution exists between mdot_lo_try and mdot_crit;
         # tighten the bracket so brentq sees only the smooth branch.
         mdot_hi_try = mdot_crit
-        g_hi = P_out_crit - P_out
+        g_hi = P_last_cell_crit - P_last_cell
 
     if g_lo * g_hi > 0:
         raise BVPNotBracketedError(
             f"Cannot bracket ṁ: g({mdot_lo_try:.2f})={g_lo:.1f}, "
             f"g({mdot_hi_try:.2f})={g_hi:.1f}. "
-            "Outlet pressure may be unreachable for this geometry."
+            "Target P_last_cell may be unreachable for this geometry."
         )
 
     _report("iterating", 0.0)
@@ -849,8 +861,8 @@ def _bvp_single_pipe_mdot(
     result = _cached_march(mdot_sol)
     result.elapsed_seconds  # already set inside march_ivp
 
-    # If this solution itself is choked and P_out_calc > P_target
-    if result.choked and float(result.P[-1]) > P_out * (1 + rtol):
+    # If this solution itself is choked and the last-cell pressure exceeds target
+    if result.choked and float(result.P[-1]) > P_last_cell * (1 + rtol):
         _annotate_eos(result)
         raise BVPChoked(
             f"BVP choked: ṁ_critical = {mdot_sol:.3f} kg/s.",
@@ -870,7 +882,7 @@ def solve_for_mdot(
     P_out: float,
     **kwargs,
 ) -> "PipeResult":
-    """Find mass flow rate such that march_ivp gives the target outlet pressure.
+    """Find ``mdot`` such that ``march_ivp`` lands at the target last-cell pressure.
 
     Thin wrapper that builds a single-element :class:`ChainSpec` around
     ``pipe`` and delegates to :func:`solve_chain` in Mode 1. The chain
@@ -881,7 +893,12 @@ def solve_for_mdot(
 
     Parameters
     ----------
-    pipe, fluid, P_in, T_in, P_out : as before.
+    pipe, fluid, P_in, T_in : as before.
+    P_out : float [Pa]
+        Silent back-compat alias for ``P_last_cell`` (CLAUDE.md
+        "Pressure terminology"). Mapped to ``P_last_cell`` when
+        forwarded to :func:`solve_chain`; new code should call
+        :func:`solve_chain` directly with ``P_last_cell=``.
     ``**kwargs`` : forwarded to :func:`solve_chain`, including
         ``mdot_bracket``, ``rtol``, ``eos_mode``, ``table_n_P``,
         ``table_n_T``, ``progress_callback``, ``cancel_event``, and any
@@ -911,7 +928,7 @@ def solve_for_mdot(
             fluid,
             T_in=T_in,
             P_in=P_in,
-            P_out=P_out,
+            P_last_cell=P_out,
             **kwargs,
         )
     except BVPChoked as exc:
@@ -938,7 +955,7 @@ def verify_eos_accuracy(
     fluid: "FluidEOSBase",
     P_in: float,
     T_in: float,
-    P_out: float,
+    P_last_cell: float,
     table_n_P: int = 50,
     table_n_T: int = 50,
     P_range_override: tuple[float, float] | None = None,
@@ -958,7 +975,7 @@ def verify_eos_accuracy(
     -------
     dict
         Keys: ``result_direct``, ``result_table``, ``mdot_rel_diff``,
-        ``P_out_diff_Pa``, ``T_out_diff_K``, ``x_choke_diff_m``,
+        ``P_last_cell_diff_Pa``, ``T_out_diff_K``, ``x_choke_diff_m``,
         ``max_rho_rel``, ``max_h_rel``, ``max_a_rel``, ``max_mu_rel``,
         ``elapsed_direct``, ``elapsed_table``, ``speedup``.
     """
@@ -967,8 +984,10 @@ def verify_eos_accuracy(
     def _run(mode: str) -> tuple["PipeResult", float]:
         t = _time.time()
         try:
+            # solve_for_mdot keeps the legacy ``P_out`` kwarg name for
+            # silent back-compat (see CLAUDE.md "Pressure terminology").
             r = solve_for_mdot(
-                pipe, fluid, P_in, T_in, P_out,
+                pipe, fluid, P_in, T_in, P_last_cell,
                 eos_mode=mode,
                 table_n_P=table_n_P, table_n_T=table_n_T,
                 P_range_override=P_range_override,
@@ -1006,7 +1025,7 @@ def verify_eos_accuracy(
         "result_direct": r_direct,
         "result_table": r_table,
         "mdot_rel_diff": abs(r_table.mdot - r_direct.mdot) / max(r_direct.mdot, 1e-30),
-        "P_out_diff_Pa": float(abs(r_table.P[-1] - r_direct.P[-1])),
+        "P_last_cell_diff_Pa": float(abs(r_table.P[-1] - r_direct.P[-1])),
         "T_out_diff_K": float(abs(r_table.T[-1] - r_direct.T[-1])),
         "x_choke_diff_m": x_choke_diff,
         "max_rho_rel": float(np.nanmax(rho_rel)) if rho_rel.size else 0.0,
@@ -1025,7 +1044,7 @@ def _find_critical_mdot(
     fluid: "FluidEOSBase",
     P_in: float,
     T_in: float,
-    P_out_target: float,
+    P_last_cell_target: float,
     mdot_lo: float,
     mdot_hi: float,
     ivp_kwargs: dict,
@@ -1036,7 +1055,10 @@ def _find_critical_mdot(
 
     Parameters
     ----------
-    pipe, fluid, P_in, T_in, P_out_target : as in solve_for_mdot
+    pipe, fluid, P_in, T_in : as in :func:`_bvp_single_pipe_mdot`.
+    P_last_cell_target : float
+        Target last-cell pressure used only for early-exit checks; this
+        helper does not optimise against it directly.
     mdot_lo, mdot_hi : float
         Search range for ṁ.
     ivp_kwargs : dict
@@ -1110,7 +1132,7 @@ def plateau_sweep(
     fluid: "FluidEOSBase",
     P_in: float,
     T_in: float,
-    P_out_array: "np.ndarray | list[float]",
+    P_last_cell_array: "np.ndarray | list[float]",
     ivp_kwargs: dict | None = None,
     cancel_event: "object | None" = None,
     on_point: Callable[[int, int, dict], None] | None = None,
@@ -1120,7 +1142,7 @@ def plateau_sweep(
     P_range_override: tuple[float, float] | None = None,
     T_range_override: tuple[float, float] | None = None,
 ) -> list[dict]:
-    """Run a BVP at each P_out and collect the (P_out, ṁ) plateau curve.
+    """Run a BVP at each target ``P_last_cell`` and collect the plateau curve.
 
     Each point is run as a fresh BVP. ``BVPChoked`` is treated as a
     success — the point is captured with ``choked=True`` and ``mdot``
@@ -1132,9 +1154,10 @@ def plateau_sweep(
     Parameters
     ----------
     pipe, fluid, P_in, T_in : as in solve_for_mdot.
-    P_out_array : sequence of float
-        Outlet pressures [Pa] to sweep. Order is preserved in the
-        returned list.
+    P_last_cell_array : sequence of float
+        Target last-cell pressures [Pa] to sweep (per-pipe internal
+        state — see CLAUDE.md "Pressure terminology"). Order is
+        preserved in the returned list.
     ivp_kwargs : dict or None
         Forwarded to solve_for_mdot (and on through to march_ivp).
     cancel_event : threading.Event-like or None
@@ -1145,7 +1168,7 @@ def plateau_sweep(
         each point. ``idx_completed`` is 1-based.
     eos_mode : {"table", "direct"} or None
         ``"table"`` (default) builds a single :class:`TabulatedFluid`
-        sized to cover the worst-case BVP probe (lowest P_out → largest
+        sized to cover the worst-case BVP probe (lowest target → largest
         ΔP and JT cooling) and reuses it across every probe — this is
         the dominant speedup for plateau sweeps. ``"direct"`` falls
         back to the raw EOS for every probe. ``None`` resolves via the
@@ -1158,9 +1181,10 @@ def plateau_sweep(
     Returns
     -------
     list[dict]
-        One dict per point with keys: ``P_out`` [Pa], ``mdot`` [kg/s],
-        ``choked`` (bool), ``M_out``, ``T_out`` [K], ``x_choke`` [m or
-        None], ``result`` (PipeResult or None), ``error`` (str or None).
+        One dict per point with keys: ``P_last_cell`` [Pa], ``mdot``
+        [kg/s], ``choked`` (bool), ``M_out``, ``T_out`` [K], ``x_choke``
+        [m or None], ``result`` (PipeResult or None), ``error`` (str or
+        None).
     """
     if ivp_kwargs is None:
         ivp_kwargs = {}
@@ -1169,15 +1193,15 @@ def plateau_sweep(
         eos_mode = os.environ.get(_DEFAULT_EOS_MODE_ENV, "table")
 
     # Build the shared table here (rather than letting each probe build
-    # its own) so it amortises over the whole sweep — the lowest P_out
+    # its own) so it amortises over the whole sweep — the lowest target
     # is the worst-case window, so any other probe's state is contained.
     if eos_mode == "table":
         if P_range_override is not None and T_range_override is not None:
             P_range, T_range = P_range_override, T_range_override
         else:
-            P_out_lowest = float(min(P_out_array))
+            P_last_cell_lowest = float(min(P_last_cell_array))
             P_min, P_max, T_min, T_max = estimate_operating_window(
-                P_in, T_in, P_out_lowest, fluid,
+                P_in, T_in, P_last_cell_lowest, fluid,
             )
             P_range = P_range_override if P_range_override is not None else (P_min, P_max)
             T_range = T_range_override if T_range_override is not None else (T_min, T_max)
@@ -1192,9 +1216,9 @@ def plateau_sweep(
         )
 
     points: list[dict] = []
-    total = len(P_out_array)
+    total = len(P_last_cell_array)
 
-    for i, P_out in enumerate(P_out_array):
+    for i, P_last_cell in enumerate(P_last_cell_array):
         if cancel_event is not None and cancel_event.is_set():
             raise SolverCancelled(
                 f"plateau_sweep cancelled at point {i + 1}/{total}"
@@ -1206,8 +1230,10 @@ def plateau_sweep(
         try:
             # Pass eos_mode='direct' so solve_for_mdot doesn't re-wrap
             # the already-tabulated fluid (or re-build a table per point).
+            # solve_for_mdot keeps the legacy ``P_out`` kwarg name for
+            # silent back-compat (see CLAUDE.md "Pressure terminology").
             result = solve_for_mdot(
-                pipe, working_fluid, P_in, T_in, P_out,
+                pipe, working_fluid, P_in, T_in, P_last_cell,
                 cancel_event=cancel_event,
                 eos_mode="direct",
                 **ivp_kwargs,
@@ -1222,7 +1248,7 @@ def plateau_sweep(
 
         if result is not None:
             point = {
-                "P_out": float(P_out),
+                "P_last_cell": float(P_last_cell),
                 "mdot": float(result.mdot),
                 "choked": bool(choked or result.choked),
                 "M_out": float(result.M[-1]),
@@ -1235,7 +1261,7 @@ def plateau_sweep(
             }
         else:
             point = {
-                "P_out": float(P_out),
+                "P_last_cell": float(P_last_cell),
                 "mdot": float("nan"),
                 "choked": False,
                 "M_out": float("nan"),

@@ -201,18 +201,19 @@ def plot_profile(
 
 
 def plot_plateau_sweep(
-    P_out_array: "np.ndarray",
+    P_last_cell_array: "np.ndarray",
     mdot_array: "np.ndarray",
     choked_flags: list[bool],
     save_path: str | None = None,
     fig=None,
 ) -> object:
-    """Plot mass flow vs outlet pressure (choke plateau diagnostic).
+    """Plot mass flow vs last-cell pressure (choke plateau diagnostic).
 
     Parameters
     ----------
-    P_out_array : array-like
-        Outlet pressures [Pa].
+    P_last_cell_array : array-like
+        Target last-cell pressures [Pa] (per-pipe internal state — see
+        CLAUDE.md "Pressure terminology").
     mdot_array : array-like
         Corresponding mass flow rates [kg/s].
     choked_flags : list[bool]
@@ -228,7 +229,7 @@ def plot_plateau_sweep(
     """
     import matplotlib.pyplot as plt
 
-    P_out = np.asarray(P_out_array, dtype=float)
+    P_last_cell = np.asarray(P_last_cell_array, dtype=float)
     mdot = np.asarray(mdot_array, dtype=float)
     choked = np.asarray(choked_flags, dtype=bool)
 
@@ -241,13 +242,13 @@ def plot_plateau_sweep(
     # Non-choked: open circles
     mask_nc = ~choked & np.isfinite(mdot)
     if np.any(mask_nc):
-        ax.scatter(P_out[mask_nc] / 1e5, mdot[mask_nc], s=60, c="blue",
+        ax.scatter(P_last_cell[mask_nc] / 1e5, mdot[mask_nc], s=60, c="blue",
                    marker="o", facecolors="none", zorder=5, label="Subsonic")
 
     # Choked: red filled squares
     mask_c = choked & np.isfinite(mdot)
     if np.any(mask_c):
-        ax.scatter(P_out[mask_c] / 1e5, mdot[mask_c], s=60, c="red",
+        ax.scatter(P_last_cell[mask_c] / 1e5, mdot[mask_c], s=60, c="red",
                    marker="s", zorder=5, label="Choked")
 
     # Plateau line
@@ -262,7 +263,7 @@ def plot_plateau_sweep(
 
     ax.set_xscale("log")
     ax.invert_xaxis()
-    ax.set_xlabel("P_out [bara]")
+    ax.set_xlabel("P_last_cell [bara]")
     ax.set_ylabel("ṁ [kg/s]")
     ax.legend(fontsize=9)
     ax.grid(True, which="both", alpha=0.3)

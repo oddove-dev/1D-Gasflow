@@ -1130,7 +1130,7 @@ class TabulatedFluid:
 def estimate_operating_window(
     P_in: float,
     T_in: float,
-    P_out: float,
+    P_last_cell: float,
     fluid: "FluidEOSBase",
     margin_factor: float = 1.1,
     T_min_floor_K: float = 80.0,
@@ -1146,8 +1146,11 @@ def estimate_operating_window(
 
     Parameters
     ----------
-    P_in, T_in, P_out : float
-        BVP boundary conditions [Pa, K, Pa].
+    P_in, T_in, P_last_cell : float
+        BVP boundary conditions [Pa, K, Pa]. ``P_last_cell`` is the
+        pressure target in the last cell of the last pipe (or the
+        inverse-direction input in Mode 3); naming follows the per-pipe
+        convention from CLAUDE.md "Pressure terminology".
     fluid : FluidEOSBase
         Used to evaluate ``mu_JT`` at the inlet for the cooling estimate.
     margin_factor : float
@@ -1170,8 +1173,8 @@ def estimate_operating_window(
         raise ValueError(
             f"margin_factor must be ≥ 1.0; got {margin_factor}"
         )
-    P_min = min(P_in, P_out) / margin_factor
-    P_max = max(P_in, P_out) * margin_factor
+    P_min = min(P_in, P_last_cell) / margin_factor
+    P_max = max(P_in, P_last_cell) * margin_factor
 
     # JT cooling estimate at the inlet. mu_JT is positive for natural gas
     # at typical conditions → ΔT_max > 0 (expansion cools).

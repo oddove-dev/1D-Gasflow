@@ -49,7 +49,7 @@ class BVPNotBracketedError(GasPipeError):
 
 
 class BVPChoked(GasPipeError):
-    """Raised when BVP target P_out is unreachable due to choking.
+    """Raised when BVP target ``P_last_cell`` is unreachable due to choking.
 
     Carries the choked solution and the critical mass flow rate.
     """

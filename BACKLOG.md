@@ -13,7 +13,7 @@ Format conventions:
 - **Item 5 — GUI integration for Device + Chain**. Lift the Pipe-only
   GUI to a chain-aware workflow: input panel hosts a chain elements
   list (Pipe / Device rows with reorder), BC section auto-detects
-  the BVP mode from which of `(P_in, P_out, mdot)` is left blank,
+  the BVP mode from which of `(P_in, P_last_cell, mdot)` is left blank,
   result tabs render per-element blocks and a chain profile plot,
   `OverChokedError` surfaces as a banner via a new `over_choked`
   SolverWorker queue kind. Three-commit pattern: scaffolding (widget
@@ -49,8 +49,10 @@ Architectural principles locked in design phase:
   expansion (A_vc ≪ A_pipe, typical PSV), η → 0 for marginal expansion.
 - mdot is a system-level quantity, not a per-device input. Devices
   always use geometry-driven mode internally (A_geom, Cd from user).
-  System BVP supports three modes: (P_in, P_out) → mdot; (P_in, mdot)
-  → P_out; (P_out, mdot) → P_in. Specify exactly two of three.
+  System BVP supports three modes: (P_in, P_last_cell) → mdot;
+  (P_in, mdot) → P_last_cell; (P_last_cell, mdot) → P_in. Specify
+  exactly two of three. See CLAUDE.md "Pressure terminology" for why
+  ``P_last_cell`` replaced the legacy ``P_out`` name.
 - EI AVIFF T2.7.3 is the sole source PWL method. SFF=6 derived from
   ThroatState.choked flag. No alternative source models (Lighthill,
   acceleration-loss formulations explicitly excluded).
@@ -90,10 +92,30 @@ Sequence (remaining; Item numbers assigned at implementation start):
   CLAUDE.md Roadmap section. Will extend chain-mode to per-branch mdot,
   and acoustic propagation to junction-summation logic.
 
+- **Outlet expansion model**: Couples ``P_last_cell`` to a true
+  chain-level ``P_out`` BC via free-jet (Mach-disk) expansion.
+  Required for physical correctness of Mode 1 and Mode 3 when the user
+  wants to specify atmospheric / receiver-vessel downstream pressure
+  rather than a per-pipe last-cell pressure. Adds a fourth chain-level
+  scalar to ``ChainResult`` and the corresponding GUI BC field. Until
+  it lands, the GUI's "Pipe end P" is honest about what it represents.
+  See CLAUDE.md "Pressure terminology" for the station map.
+
 - **Outlet expansion analysis**: 1D diagnostics for choked outlets where
   pipe-end P >> ambient — Mach disk position, fully expanded jet state,
   thrust on pipe support. Flare-stack / blowdown discharge use cases.
-  Detailed design notes in git history at commit `2b944d9`.
+  Naturally follows from / shares physics with the Outlet expansion
+  model item above; expected to land as a sibling output once that
+  model is wired in. Detailed design notes in git history at commit
+  `2b944d9`.
+
+- **Device-first and Device-last chain topologies**: Remove the
+  ``ChainSpec`` "first/last must be Pipe" validation; extend
+  ``solve_chain`` to handle stagnation-as-``P_in`` (Device first —
+  PSV-on-pipe rather than PSV-on-tank) and Borda-Carnot-to-chain-outlet
+  (Device last — orifice at outlet). Touches the per-pipe march entry
+  state and the chain-level ``P_in`` interpretation documented in
+  CLAUDE.md "Pressure terminology". Estimate: 2–3 days.
 
 - **Constant-fluid mode (incompressible)**: `ConstantFluid` wrapper with
   fixed ρ, μ; bypasses energy equation and acceleration term. Extends
@@ -101,9 +123,10 @@ Sequence (remaining; Item numbers assigned at implementation start):
   design notes in git history at commit `2b944d9`.
 
 - **BVPChoked summary clarity**: When BVPChoked is raised, summary should
-  explicitly flag the *target* P_out as unreachable rather than just
-  showing the actual choke-limited outlet. Requires passing target P_out
-  into `PipeResult.boundary_conditions`. Trivial fix.
+  explicitly flag the *target* ``P_last_cell`` as unreachable rather
+  than just showing the actual choke-limited last-cell pressure.
+  Requires passing the target into ``PipeResult.boundary_conditions``.
+  Trivial fix.
 
 - **Held-out validation**: Sour gas compositions, very long pipes, helium-
   rich compositions. Confirms tabulated EOS generalizes beyond Skarv default
@@ -133,6 +156,14 @@ Sequence (remaining; Item numbers assigned at implementation start):
 
 ## Done
 
+- **2026-05-16**: Pressure terminology hotfix — rename `P_out` →
+  `P_last_cell` across `chain.py`, `solver.py`, `eos.py`, `errors.py`,
+  `diagnostics.py`, `gui.py`, and tests; reserve the `P_out` name for a
+  future chain-level post-expansion BC. `ChainResult.P_out` retained as
+  a `DeprecationWarning` alias; `solve_for_mdot.P_out` retained as a
+  silent back-compat alias. GUI field "Outlet P" relabeled to "Pipe
+  end P" with hover tooltip. New CLAUDE.md "Pressure terminology"
+  section makes the station map explicit.
 - **2026-05-14**: Chain-layer hotfix — `solve_chain` Mode 1 single-pipe
   fast-path wraps `BVPChoked.result` PipeResult in a single-element
   `ChainResult` for a uniform exception payload type with the

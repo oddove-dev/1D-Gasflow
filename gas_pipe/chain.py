@@ -2,8 +2,13 @@
 
 A :class:`ChainSpec` is a sequence ``Pipe → [Device → Pipe]*`` from
 inlet to outlet. :func:`solve_chain` is a three-mode dispatcher: exactly
-two of ``(P_in, P_out, mdot)`` must be given; ``T_in`` is always required
-because temperature propagates forward.
+two of ``(P_in, P_last_cell, mdot)`` must be given; ``T_in`` is always
+required because temperature propagates forward.
+
+``P_last_cell`` is the pressure in the last cell of the last pipe — a
+per-pipe computed quantity, not a chain-level downstream BC. The name
+``P_out`` is reserved for the future chain-level post-expansion BC; see
+the "Pressure terminology" section of ``CLAUDE.md``.
 
 For the PSV-on-tank scenario (no upstream pipe) call
 :meth:`Device.from_stagnation` directly — that's a single-device
@@ -15,6 +20,7 @@ import logging
 import math
 import os
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Union
 
@@ -112,13 +118,24 @@ class ChainSpec:
 
 @dataclass
 class ChainResult:
-    """Result of :func:`solve_chain` — per-element states + chain summary."""
+    """Result of :func:`solve_chain` — per-element states + chain summary.
+
+    ``P_in`` is the chain-level upstream BC (interpretation depends on the
+    first element: ``P_first_cell`` of pipe 1 when the chain starts with
+    Pipe; stagnation upstream of the device when it starts with Device —
+    not yet reachable, the latter is future work).
+
+    ``P_last_cell`` is the pressure in the last cell of the last pipe — a
+    computed quantity. The legacy name ``P_out`` is exposed as a
+    deprecation alias; it is reserved for the future chain-level
+    post-expansion BC and should not be used in new code.
+    """
 
     chain: ChainSpec
     results: list[Union["PipeResult", DeviceResult]]
     mdot: float
     P_in: float
-    P_out: float
+    P_last_cell: float
     T_in: float
     T_out: float
     boundary_conditions: dict
@@ -136,6 +153,24 @@ class ChainResult:
     @property
     def device_results(self) -> list[DeviceResult]:
         return [r for r in self.results if isinstance(r, DeviceResult)]
+
+    @property
+    def P_out(self) -> float:
+        """Deprecated alias for :attr:`P_last_cell`.
+
+        ``P_out`` is reserved for the future chain-level downstream BC
+        (post free-jet expansion). Until that BC and the corresponding
+        outlet-expansion model land, this alias returns ``P_last_cell``
+        unchanged so legacy callers keep working — but new code should
+        read ``P_last_cell`` directly.
+        """
+        warnings.warn(
+            "ChainResult.P_out is deprecated; use P_last_cell instead. "
+            "P_out is reserved for the future chain-level post-expansion BC.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.P_last_cell
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +403,7 @@ def _chain_forward_march(
         results=results,
         mdot=mdot,
         P_in=P_in,
-        P_out=P_current,
+        P_last_cell=P_current,
         T_in=T_in,
         T_out=T_current,
         boundary_conditions=boundary_conditions,
@@ -392,7 +427,7 @@ def solve_chain(
     T_in: float,
     *,
     P_in: float | None = None,
-    P_out: float | None = None,
+    P_last_cell: float | None = None,
     mdot: float | None = None,
     mdot_bracket: tuple[float, float] | None = None,
     P_in_bracket: tuple[float, float] | None = None,
@@ -408,12 +443,14 @@ def solve_chain(
 ) -> ChainResult:
     """Three-mode chain BVP solver. See module docstring for overview."""
     given = [
-        name for name, val in (("P_in", P_in), ("P_out", P_out), ("mdot", mdot))
+        name for name, val in (
+            ("P_in", P_in), ("P_last_cell", P_last_cell), ("mdot", mdot),
+        )
         if val is not None
     ]
     if len(given) != 2:
         raise ValueError(
-            "solve_chain requires exactly two of (P_in, P_out, mdot); "
+            "solve_chain requires exactly two of (P_in, P_last_cell, mdot); "
             f"got {given}"
         )
 
@@ -425,7 +462,7 @@ def solve_chain(
     # preserved exactly (bracket heuristics, _find_critical_mdot, etc.).
     if (
         "P_in" in given
-        and "P_out" in given
+        and "P_last_cell" in given
         and len(chain.elements) == 1
     ):
         from .solver import _bvp_single_pipe_mdot
@@ -438,7 +475,7 @@ def solve_chain(
                 results=[pr],
                 mdot=pr.mdot,
                 P_in=P_in,
-                P_out=float(pr.P[-1]),
+                P_last_cell=float(pr.P[-1]),
                 T_in=T_in,
                 T_out=float(pr.T[-1]),
                 boundary_conditions=bcs,
@@ -454,7 +491,7 @@ def solve_chain(
 
         try:
             pipe_result = _bvp_single_pipe_mdot(
-                pipe, fluid, P_in, T_in, P_out,
+                pipe, fluid, P_in, T_in, P_last_cell,
                 mdot_bracket=mdot_bracket,
                 rtol=rtol,
                 progress_callback=progress_callback,
@@ -503,8 +540,8 @@ def solve_chain(
             # endpoint pressure is unknown, use the known pressure as a
             # representative; estimate_operating_window's margin_factor
             # widens the window.
-            P_known = P_in if P_in is not None else P_out
-            P_other = P_out if P_out is not None else P_in
+            P_known = P_in if P_in is not None else P_last_cell
+            P_other = P_last_cell if P_last_cell is not None else P_in
             if P_range_override is not None and T_range_override is not None:
                 P_range, T_range = P_range_override, T_range_override
             else:
@@ -534,10 +571,10 @@ def solve_chain(
             **ivp_kwargs,
         )
 
-    if "P_in" in given and "P_out" in given:
+    if "P_in" in given and "P_last_cell" in given:
         return _mode1_brentq(
             chain, working_fluid, base_fluid,
-            P_in, T_in, P_out,
+            P_in, T_in, P_last_cell,
             mdot_bracket=mdot_bracket,
             rtol=rtol,
             progress_callback=progress_callback,
@@ -548,10 +585,10 @@ def solve_chain(
             **ivp_kwargs,
         )
 
-    # Mode 3 — (P_out, mdot) given.
+    # Mode 3 — (P_last_cell, mdot) given.
     return _mode3_brentq(
         chain, working_fluid, base_fluid,
-        T_in, P_out, mdot,
+        T_in, P_last_cell, mdot,
         P_in_bracket=P_in_bracket,
         rtol=rtol,
         progress_callback=progress_callback,
@@ -574,7 +611,7 @@ def _mode1_brentq(
     base_fluid: "GERGFluid",
     P_in: float,
     T_in: float,
-    P_out_target: float,
+    P_last_cell_target: float,
     *,
     mdot_bracket: tuple[float, float] | None,
     rtol: float,
@@ -598,7 +635,7 @@ def _mode1_brentq(
         from .solver import _aga_estimate_mdot
         first_pipe = chain.pipes[0]
         mdot_mid = _aga_estimate_mdot(
-            first_pipe, working_fluid, P_in, T_in, P_out_target,
+            first_pipe, working_fluid, P_in, T_in, P_last_cell_target,
         )
         mdot_lo, mdot_hi = mdot_mid * 0.01, mdot_mid * 5.0
         inlet = working_fluid.props(P_in, T_in)
@@ -636,7 +673,7 @@ def _mode1_brentq(
                 return _CHOKED_SENTINEL
             last_good = r
             last_good_mdot = mdot_try
-            return r.P_out - P_out_target
+            return r.P_last_cell - P_last_cell_target
         except OverChokedError as exc:
             last_choked_mdot = mdot_try
             last_choke_diag = {
@@ -684,7 +721,7 @@ def _mode1_brentq(
         f_lo = _obj(mdot_lo)
 
     # If hi is choked, locate mdot_critical and decide whether the target
-    # P_out is reachable below it (mirrors the legacy
+    # P_last_cell is reachable below it (mirrors the legacy
     # _bvp_single_pipe_mdot pattern).
     if f_hi == _CHOKED_SENTINEL:
         if f_lo == _CHOKED_SENTINEL:
@@ -712,17 +749,17 @@ def _mode1_brentq(
                 m_lo = m_mid
         mdot_critical = m_lo
         r_crit = _march(mdot_critical)
-        P_out_crit = r_crit.P_out
+        P_last_cell_crit = r_crit.P_last_cell
 
-        if P_out_crit > P_out_target * (1.0 + rtol):
-            # At choke-limited mdot, P_out is still above target → target
-            # is below the choke-limited minimum and cannot be reached.
+        if P_last_cell_crit > P_last_cell_target * (1.0 + rtol):
+            # At choke-limited mdot, P_last_cell is still above target →
+            # target is below the choke-limited minimum and cannot be reached.
             r_crit.choked = True
             r_crit.choke_diagnostics = last_choke_diag or {"kind": "boundary"}
             raise BVPChoked(
                 f"Chain choked at mdot_critical={mdot_critical:.4f} kg/s; "
-                f"target P_out={P_out_target/1e5:.3f} bara is unreachable. "
-                f"Choke diagnostic: {last_choke_diag}",
+                f"target P_last_cell={P_last_cell_target/1e5:.3f} bara is "
+                f"unreachable. Choke diagnostic: {last_choke_diag}",
                 mdot_critical=mdot_critical,
                 result=r_crit,
             )
@@ -730,7 +767,7 @@ def _mode1_brentq(
         # Target IS reachable below mdot_critical — tighten the upper
         # bracket and continue with brentq on the smooth branch.
         mdot_hi = mdot_critical
-        f_hi = P_out_crit - P_out_target
+        f_hi = P_last_cell_crit - P_last_cell_target
 
     if f_lo * f_hi > 0:
         raise BVPNotBracketedError(
@@ -744,7 +781,11 @@ def _mode1_brentq(
         raise BVPNotBracketedError(f"brentq failed: {exc}") from exc
 
     final = _march(mdot_sol)
-    if final.choked and abs(final.P_out - P_out_target) > rtol * P_out_target:
+    if (
+        final.choked
+        and abs(final.P_last_cell - P_last_cell_target)
+        > rtol * P_last_cell_target
+    ):
         raise BVPChoked(
             f"Mode 1: chain choked at mdot_sol={mdot_sol:.4f} kg/s.",
             mdot_critical=mdot_sol,
@@ -769,7 +810,7 @@ def _build_minimal_choked_result(
         results=[],
         mdot=mdot,
         P_in=P_in,
-        P_out=float("nan"),
+        P_last_cell=float("nan"),
         T_in=T_in,
         T_out=float("nan"),
         boundary_conditions=boundary_conditions,
@@ -790,7 +831,7 @@ def _mode3_brentq(
     working_fluid: "FluidEOSBase",
     base_fluid: "GERGFluid",
     T_in: float,
-    P_out_target: float,
+    P_last_cell_target: float,
     mdot: float,
     *,
     P_in_bracket: tuple[float, float] | None,
@@ -802,18 +843,21 @@ def _mode3_brentq(
     t0: float,
     **ivp_kwargs,
 ) -> ChainResult:
-    """Mode 3 — brentq on ``P_in`` to match ``P_out_target`` at given ``mdot``.
+    """Mode 3 — brentq on ``P_in`` to match ``P_last_cell_target`` at ``mdot``.
 
     On bracket exhaustion (no feasible ``P_in``), raise
     :class:`OverChokedError` with a Mode-3-specific message identifying
     the infeasibility scope.
     """
     if P_in_bracket is None:
-        # Default upper bound at 10×P_out — wide enough for typical flows
-        # without pushing the chain march into EOS-out-of-range / device
-        # over-choke at extreme stagnation. Walk-down below handles the
-        # edge case where this still lands in an infeasible probe region.
-        P_in_lo, P_in_hi = P_out_target * 1.01, P_out_target * 10.0
+        # Default upper bound at 10× the target — wide enough for typical
+        # flows without pushing the chain march into EOS-out-of-range /
+        # device over-choke at extreme stagnation. Walk-down below handles
+        # the edge case where this still lands in an infeasible probe region.
+        P_in_lo, P_in_hi = (
+            P_last_cell_target * 1.01,
+            P_last_cell_target * 10.0,
+        )
     else:
         P_in_lo, P_in_hi = P_in_bracket
 
@@ -836,7 +880,7 @@ def _mode3_brentq(
             r = _march(P_in_try)
             if r.choked:
                 return _CHOKED_SENTINEL
-            return r.P_out - P_out_target
+            return r.P_last_cell - P_last_cell_target
         except OverChokedError as exc:
             last_choke = exc
             return _CHOKED_SENTINEL
@@ -868,9 +912,10 @@ def _mode3_brentq(
     # another sentinel band.
     while f_hi < 0:
         P_in_hi_new = P_in_hi * 3.0
-        if P_in_hi_new > 1000.0 * P_out_target:
+        if P_in_hi_new > 1000.0 * P_last_cell_target:
             raise BVPNotBracketedError(
-                f"Mode 3: P_out_target={P_out_target/1e5:.3f} bara "
+                f"Mode 3: P_last_cell_target="
+                f"{P_last_cell_target/1e5:.3f} bara "
                 f"unreachable even at P_in={P_in_hi/1e5:.3f} bara."
             )
         f_new = _obj(P_in_hi_new)

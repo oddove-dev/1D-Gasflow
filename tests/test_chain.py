@@ -69,31 +69,31 @@ class TestRoundtrip:
         chain = ChainSpec(elements=[pipe_long, device, pipe_short])
 
         P_in_target = 50e5
-        P_out_target = 45e5
+        P_last_cell_target = 45e5
         T_in = 300.0
 
         # Mode 1 → mdot
         r1 = solve_chain(
             chain, methane, T_in=T_in,
-            P_in=P_in_target, P_out=P_out_target,
+            P_in=P_in_target, P_last_cell=P_last_cell_target,
             eos_mode="direct",
         )
         assert not r1.choked
         mdot = r1.mdot
         assert mdot > 0.0
 
-        # Mode 2 (P_in, mdot → P_out)
+        # Mode 2 (P_in, mdot → P_last_cell)
         r2 = solve_chain(
             chain, methane, T_in=T_in,
             P_in=P_in_target, mdot=mdot,
             eos_mode="direct",
         )
-        assert r2.P_out == pytest.approx(P_out_target, rel=1e-3)
+        assert r2.P_last_cell == pytest.approx(P_last_cell_target, rel=1e-3)
 
-        # Mode 3 (P_out, mdot → P_in)
+        # Mode 3 (P_last_cell, mdot → P_in)
         r3 = solve_chain(
             chain, methane, T_in=T_in,
-            P_out=P_out_target, mdot=mdot,
+            P_last_cell=P_last_cell_target, mdot=mdot,
             eos_mode="direct",
         )
         assert r3.P_in == pytest.approx(P_in_target, rel=1e-3)
@@ -108,16 +108,16 @@ class TestMode1BVPChokedMapping:
         self, methane: GERGFluid, pipe_long: Pipe, pipe_short: Pipe,
     ) -> None:
         # Small A_geom forces device choke at low mdot (~12.4 kg/s); at
-        # that choke-limited mdot, the chain's minimum reachable P_out is
-        # ~32 bara. Target P_out=20 bara is below that → unreachable →
-        # BVPChoked.
+        # that choke-limited mdot, the chain's minimum reachable
+        # P_last_cell is ~32 bara. Target P_last_cell=20 bara is below
+        # that → unreachable → BVPChoked.
         device = Device(A_geom=2e-3, Cd=0.7, name="V-tight")
         chain = ChainSpec(elements=[pipe_long, device, pipe_short])
 
         with pytest.raises(BVPChoked) as excinfo:
             solve_chain(
                 chain, methane, T_in=300.0,
-                P_in=50e5, P_out=20e5,
+                P_in=50e5, P_last_cell=20e5,
                 eos_mode="direct",
             )
 
@@ -142,9 +142,9 @@ class TestMode1BVPChokedMapping:
         PipeResult that _bvp_single_pipe_mdot raised with.
 
         Uses local fluid + pipe (not the module-scoped fixtures) so the
-        aggressive choke search (P_out → 1 bara) doesn't pollute the
-        shared GERGFluid cache and perturb the byte-identical-regression
-        test's brentq trajectory.
+        aggressive choke search (P_last_cell → 1 bara) doesn't pollute
+        the shared GERGFluid cache and perturb the byte-identical-
+        regression test's brentq trajectory.
         """
         from gas_pipe.chain import ChainResult
 
@@ -156,7 +156,7 @@ class TestMode1BVPChokedMapping:
         with pytest.raises(BVPChoked) as excinfo:
             solve_chain(
                 chain, local_fluid, T_in=300.0,
-                P_in=50e5, P_out=1e5,
+                P_in=50e5, P_last_cell=1e5,
                 eos_mode="direct",
             )
         assert isinstance(excinfo.value.result, ChainResult), (
@@ -208,7 +208,7 @@ class TestMode3Infeasibility:
         with pytest.raises(OverChokedError, match="Mode 3 infeasible") as excinfo:
             solve_chain(
                 chain, methane, T_in=300.0,
-                P_out=20e5, mdot=500.0,
+                P_last_cell=20e5, mdot=500.0,
                 eos_mode="direct",
             )
 
@@ -250,12 +250,14 @@ class TestSinglePipeRegression:
     def test_byte_identical_with_solve_for_mdot(
         self, methane: GERGFluid, pipe_long: Pipe,
     ) -> None:
-        P_in, T_in, P_out = 50e5, 300.0, 40e5
+        P_in, T_in, P_last_cell = 50e5, 300.0, 40e5
 
-        # Legacy path
+        # Legacy path — solve_for_mdot keeps the ``P_out`` kwarg as a
+        # silent back-compat alias for ``P_last_cell`` (CLAUDE.md
+        # "Pressure terminology").
         r_legacy = solve_for_mdot(
             pipe_long, methane,
-            P_in=P_in, T_in=T_in, P_out=P_out,
+            P_in=P_in, T_in=T_in, P_out=P_last_cell,
             eos_mode="direct",
         )
 
@@ -263,7 +265,7 @@ class TestSinglePipeRegression:
         chain = ChainSpec(elements=[pipe_long])
         r_chain = solve_chain(
             chain, methane, T_in=T_in,
-            P_in=P_in, P_out=P_out,
+            P_in=P_in, P_last_cell=P_last_cell,
             eos_mode="direct",
         )
         r_chain_pipe = r_chain.results[0]
