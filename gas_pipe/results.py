@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import pandas as pd
@@ -180,6 +180,16 @@ class PipeResult:
     # Each entry: {x, from_section, to_section, A_up, A_dn, type, dP,
     # dP_loss, dP_acc}. Empty for single-section pipes.
     section_transitions: list[dict] = field(default_factory=list)
+
+    # Integration direction. ``"forward"`` is the default — inlet → outlet
+    # marching via ``march_ivp``. ``"backward"`` is set by
+    # ``march_ivp_backward`` for pipes downstream of a chain choke point,
+    # where the outlet P is the chain BC and the inlet P is computed by
+    # backward integration with the ``h_stag = const`` invariant.
+    # See CLAUDE.md "Pressure terminology" for context; the array
+    # orientation (``x[0]`` = inlet, ``x[-1]`` = outlet) is the same in
+    # both modes — only the order of integration differs.
+    march_direction: Literal["forward", "backward"] = "forward"
 
     def summary(self) -> str:
         """Return a formatted multi-line summary string (~70-80 chars wide).

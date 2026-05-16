@@ -22,13 +22,16 @@ from .eos import TabulatedFluid, estimate_operating_window
 # explicitly; the env var is a back door, not part of the public API.
 _DEFAULT_EOS_MODE_ENV = "GAS_PIPE_DEFAULT_EOS_MODE"
 from .errors import (
+    BackwardMarchDiabaticNotSupported,
     BVPChoked,
     BVPNotBracketedError,
     ChokeReached,
+    EOSOutOfRange,
     IntegrationCapExceeded,
     SegmentConvergenceError,
     SolverCancelled,
 )
+from .friction import darcy_friction
 from .segment import bisect_for_choke, estimate_M_downstream, solve_segment
 
 if TYPE_CHECKING:
@@ -90,6 +93,7 @@ def _build_result(
     elapsed: float,
     n_adaptive: int,
     section_transitions: list[dict],
+    march_direction: str = "forward",
 ) -> "PipeResult":
     """Assemble PipeResult from accumulated per-segment data."""
     from .results import PipeResult
@@ -238,6 +242,7 @@ def _build_result(
         x_dewpoint_crossing=x_dewpoint_crossing,
         LVF=LVF_arr,
         section_transitions=list(section_transitions),
+        march_direction=march_direction,
     )
 
 
@@ -572,6 +577,430 @@ def march_ivp(
         fluid=fluid, pipe=pipe, bc=bc, opts=opts,
         elapsed=elapsed, n_adaptive=n_adaptive,
         section_transitions=section_transitions,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Backward march primitive (v1 — adiabatic only)
+# ---------------------------------------------------------------------------
+#
+# Pipes downstream of a chain choke point own their ``P_first_cell`` via
+# backward integration from the chain-end BC. The Borda-Carnot transition
+# at the choked device still produces a predicted downstream-state
+# (retained as a diagnostic on ``DeviceResult.transition``) but the
+# actual downstream pipe inlet state comes from these backward routines.
+#
+# v1 scope:
+#   - Adiabatic pipe only (every section's ``overall_U == 0``); diabatic
+#     pipes raise :class:`BackwardMarchDiabaticNotSupported`.
+#   - Single-section pipe assumed; multi-section pipe support is future
+#     work — the loop here still walks ``pipe.section_at`` per segment so
+#     a single homogeneous section works, but section transitions
+#     downstream of a choked device are not yet modelled.
+#   - No fittings inside the backward-marched pipe.
+#   - Mach asymptote band is not expected (sub-choke downstream of a
+#     choked element); the routine uses linear discretization with no
+#     adaptive refinement.
+
+
+def state_from_P_hstag(
+    fluid: "FluidEOSBase",
+    P: float,
+    h_stag: float,
+    mdot: float,
+    A: float,
+    T_guess: float | None = None,
+    tol: float = 1e-5,
+    max_iter: int = 30,
+) -> "FluidState":
+    """Find the FluidState at pressure ``P`` whose stagnation enthalpy is ``h_stag``.
+
+    Energy invariant for an adiabatic pipe is
+    ``h_static + u² / 2 = h_stag``, where ``u = mdot / (ρ · A)`` and
+    ``ρ = ρ_eos(P, T)``. Given ``(P, h_stag, mdot, A)`` this fully
+    determines ``T``, which we recover via Newton iteration with
+    finite-difference derivative (CoolProp's analytic ∂ρ/∂T is not
+    universally available so FD is the robust choice).
+
+    Used by :func:`march_ivp_backward` to infer the per-station
+    temperature from the locally-known pressure, side-stepping the
+    apparent mixed BVP (T forward, P backward) that would arise if we
+    integrated the energy ODE backward as well.
+
+    Parameters
+    ----------
+    fluid : FluidEOSBase
+    P : float
+        Pressure [Pa].
+    h_stag : float
+        Stagnation enthalpy [J/kg], constant along an adiabatic pipe.
+    mdot : float
+        Mass flow rate [kg/s].
+    A : float
+        Local cross-sectional area [m²].
+    T_guess : float or None
+        Optional initial guess for Newton. If None, uses 300 K.
+    tol : float
+        Relative tolerance on the residual ``(h + u²/2 − h_stag) / max(|h_stag|, 1)``.
+    max_iter : int
+        Newton iteration cap.
+
+    Returns
+    -------
+    FluidState
+
+    Raises
+    ------
+    SegmentConvergenceError
+        If Newton fails to converge in ``max_iter`` iterations.
+    """
+    # Newton on T with FD derivative on the full residual.
+    T = float(T_guess) if T_guess is not None else 300.0
+    # Scale for relative tolerance — bound below by 1 J/kg to handle
+    # the (unphysical but possible) case of h_stag ≈ 0.
+    scale = max(abs(h_stag), 1.0)
+    # 10 mK FD step: large enough that the absolute noise floor on
+    # CoolProp's h (~0.01 J/kg) is small compared to dh = cp·delta_T
+    # ≈ 20 J/kg, keeping the FD-derivative noise well below 1%.
+    delta_T = 1e-2
+
+    for _ in range(max_iter):
+        try:
+            state = fluid.props(P, T)
+        except EOSOutOfRange as exc:
+            # Damped Newton step excursed into a region GERG cannot
+            # evaluate (typically below the dew curve or in liquid
+            # territory at moderate-T methane). Re-raise as a
+            # SegmentConvergenceError so callers (march_ivp_backward,
+            # chain solver) can handle it uniformly with Newton-failure
+            # paths rather than EOS-validity paths.
+            raise SegmentConvergenceError(
+                f"state_from_P_hstag: EOS evaluation failed at "
+                f"P={P / 1e5:.3f} bara, T={T:.2f} K during Newton "
+                f"iteration. Underlying EOS error: {exc}"
+            ) from exc
+        u = mdot / (state.rho * A)
+        R = state.h + 0.5 * u * u - h_stag
+        if abs(R) < tol * scale:
+            return state
+        # FD derivative of the residual w.r.t. T.
+        try:
+            state_p = fluid.props(P, T + delta_T)
+        except EOSOutOfRange as exc:
+            raise SegmentConvergenceError(
+                f"state_from_P_hstag: EOS evaluation failed at "
+                f"P={P / 1e5:.3f} bara, T={T + delta_T:.2f} K while "
+                f"computing FD derivative. Underlying error: {exc}"
+            ) from exc
+        u_p = mdot / (state_p.rho * A)
+        R_p = state_p.h + 0.5 * u_p * u_p - h_stag
+        dR_dT = (R_p - R) / delta_T
+        if abs(dR_dT) < 1e-30:
+            raise SegmentConvergenceError(
+                "state_from_P_hstag: zero derivative at "
+                f"P={P / 1e5:.3f} bara, T={T:.2f} K. "
+                "Cannot continue Newton iteration."
+            )
+        # Damped Newton step: cap |ΔT| at 50 K to avoid wild excursions
+        # near the dew curve or other near-singular EOS regions.
+        step = -R / dR_dT
+        if step > 50.0:
+            step = 50.0
+        elif step < -50.0:
+            step = -50.0
+        T += step
+        # Hard floor / ceiling consistent with GERG's validity envelope.
+        if T < 80.0:
+            T = 80.0
+        if T > 700.0:
+            T = 700.0
+
+    raise SegmentConvergenceError(
+        f"state_from_P_hstag failed to converge in {max_iter} iterations "
+        f"at P={P / 1e5:.3f} bara, h_stag={h_stag:.1f} J/kg, "
+        f"mdot={mdot:.4f} kg/s, A={A * 1e4:.3f} cm². Last T={T:.2f} K, "
+        f"residual={R:.3e} J/kg."
+    )
+
+
+def _segment_residual_backward(
+    P_im1: float,
+    fluid: "FluidEOSBase",
+    pipe: "Pipe",
+    x_im1: float,
+    x_i: float,
+    state_i: "FluidState",
+    h_stag: float,
+    mdot: float,
+    friction_model: str,
+) -> tuple[float, "FluidState", dict]:
+    """Momentum residual for one backward-march segment.
+
+    Given downstream state ``state_i`` at ``x_i`` and a trial upstream
+    pressure ``P_{i-1}`` at ``x_{i-1}``, compute the upstream state via
+    :func:`state_from_P_hstag`, evaluate the momentum balance over the
+    segment, and return ``(R, state_im1, info)`` where ``R = 0`` at the
+    converged segment solution. Mirrors :func:`_segment_residuals` in
+    segment.py but with the energy equation replaced by the h_stag
+    invariant — see module-level note on adiabatic scope.
+    """
+    x_mid = 0.5 * (x_im1 + x_i)
+    sec, _, _ = pipe.section_at(x_mid)
+    A_seg = sec.area
+    D = sec.inner_diameter
+    dx = x_i - x_im1
+
+    # Compute state_{i-1} from the trial pressure under the h_stag
+    # invariant. Seed T at state_i's value (smooth along the segment).
+    state_im1 = state_from_P_hstag(
+        fluid, P_im1, h_stag, mdot, A_seg, T_guess=state_i.T,
+    )
+
+    P_avg = 0.5 * (P_im1 + state_i.P)
+    state_avg = state_from_P_hstag(
+        fluid, P_avg, h_stag, mdot, A_seg, T_guess=state_im1.T,
+    )
+    rho_avg = state_avg.rho
+    mu_avg = state_avg.mu
+    u_avg = mdot / (rho_avg * A_seg)
+
+    Re = rho_avg * u_avg * D / mu_avg
+    f = darcy_friction(Re, sec.eps_over_D, friction_model)
+
+    dP_fric = f * (dx / D) * rho_avg * u_avg ** 2 / 2.0
+    dP_acc = (mdot / A_seg) ** 2 * (1.0 / state_i.rho - 1.0 / state_im1.rho)
+    dz = pipe.z(x_i) - pipe.z(x_im1)
+    dP_elev = rho_avg * _G * dz
+
+    # Forward momentum balance: (P_{i-1} − P_i) − dP_fric − dP_acc − dP_elev = 0
+    # (same form as forward _segment_residuals: pressure drops going
+    # downstream by friction + acceleration + elevation).
+    R = (P_im1 - state_i.P) - dP_fric - dP_acc - dP_elev
+
+    info = {
+        "n_iter": 0,  # populated by the outer Newton loop in march_ivp_backward
+        "f": float(f),
+        "Re": float(Re),
+        "dP_fric": float(dP_fric),
+        "dP_acc": float(dP_acc),
+        "dP_elev": float(dP_elev),
+        "dP_fitting": 0.0,
+        "q_seg": 0.0,
+        "A_out": float(A_seg),
+        "M_ip1": float(u_avg / state_avg.a),
+        "section_transition": None,
+    }
+    return R, state_im1, info
+
+
+def march_ivp_backward(
+    pipe: "Pipe",
+    fluid: "FluidEOSBase",
+    P_outlet: float,
+    h_stag: float,
+    mdot: float,
+    n_segments: int = 100,
+    friction_model: str = "blended",
+    cancel_event: "object | None" = None,
+) -> "PipeResult":
+    """Backward-march from outlet to inlet at fixed ``mdot`` and h_stag.
+
+    Pipes downstream of a chain choke point have their outlet pressure
+    pinned to the chain BC. Their inlet pressure is a computed quantity,
+    obtained by integrating the momentum equation **against the flow**
+    while inferring the per-station temperature from the
+    ``h_stag = const`` invariant (adiabatic assumption — see module-
+    level note).
+
+    Returned :class:`PipeResult` carries arrays in the usual inlet→outlet
+    order (``x[0] == 0``, ``x[-1] == pipe.length``); the field
+    ``march_direction == "backward"`` flags the integration mode for
+    downstream consumers (GUI annotation, diagnostics).
+
+    Parameters
+    ----------
+    pipe : Pipe
+        Must be adiabatic (every section's ``overall_U == 0``); diabatic
+        pipes raise :class:`BackwardMarchDiabaticNotSupported`.
+    fluid : FluidEOSBase
+    P_outlet : float
+        Last-cell pressure BC [Pa].
+    h_stag : float
+        Stagnation enthalpy [J/kg], conserved along the pipe under
+        adiabatic conditions. Must be passed in by the caller from the
+        upstream choked element's energy state.
+    mdot : float
+        Mass flow rate [kg/s], set by the upstream choked element.
+    n_segments : int
+        Number of segments for linear discretization. Adaptive
+        refinement is not needed in v1 (no Fanno asymptote downstream
+        of a choke).
+    friction_model : str
+        Friction model identifier (forwarded to ``darcy_friction``).
+    cancel_event : threading.Event-like or None
+        Cooperative cancel; checked every 10 segments.
+
+    Returns
+    -------
+    PipeResult
+        With ``march_direction == "backward"``, ``P[-1] == P_outlet``,
+        and ``P[0]`` the backward-computed first-cell pressure.
+
+    Raises
+    ------
+    BackwardMarchDiabaticNotSupported
+        If any pipe section has ``overall_U > 0``.
+    SegmentConvergenceError
+        If per-segment Newton fails after the inner retry.
+    """
+    # Adiabatic precondition. h_stag invariant requires no wall heat
+    # transfer; v1 fails loudly here rather than silently approximating.
+    for idx, sec in enumerate(pipe.sections):
+        if sec.overall_U != 0.0:
+            raise BackwardMarchDiabaticNotSupported(
+                f"march_ivp_backward requires adiabatic conditions; "
+                f"pipe section {idx} has overall_U = {sec.overall_U} "
+                "W/(m²·K). Either set overall_U = 0 on this section for "
+                "v1, or wait for the diabatic extension (forward-T-"
+                "backward-P iteration)."
+            )
+
+    t0 = time.time()
+    L = pipe.length
+
+    # Linear grid: n_segments uniform segments, n_segments + 1 stations.
+    n = max(int(n_segments), 1)
+    xs = [L * i / n for i in range(n + 1)]
+
+    # Outlet station: state directly from BC + h_stag invariant.
+    A_outlet = pipe.section_at(L)[0].area
+    state_out = state_from_P_hstag(
+        fluid, P_outlet, h_stag, mdot, A_outlet,
+    )
+
+    # Arrays accumulated in OUTLET→INLET order, reversed at the end so
+    # the final PipeResult presents inlet→outlet like a forward march.
+    rev_x: list[float] = [L]
+    rev_states: list = [state_out]
+    rev_A: list[float] = [A_outlet]
+    rev_Re: list[float] = []
+    rev_seg_info: list[dict] = []
+
+    state_i = state_out
+
+    for seg_idx in range(n, 0, -1):
+        x_i = xs[seg_idx]
+        x_im1 = xs[seg_idx - 1]
+        A_seg = pipe.section_at(0.5 * (x_im1 + x_i))[0].area
+
+        # Initial guess: explicit-Euler step, assuming friction-only
+        # pressure rise going backward (against the flow).
+        D = pipe.section_at(0.5 * (x_im1 + x_i))[0].inner_diameter
+        u_i = mdot / (state_i.rho * A_seg)
+        Re_i = state_i.rho * u_i * D / state_i.mu
+        f_i = darcy_friction(
+            Re_i, pipe.section_at(0.5 * (x_im1 + x_i))[0].eps_over_D,
+            friction_model,
+        )
+        dP_fric_guess = f_i * ((x_i - x_im1) / D) * state_i.rho * u_i ** 2 / 2.0
+        P_im1 = state_i.P + dP_fric_guess
+
+        # Per-segment 1-D Newton on P_{i-1}.
+        converged = False
+        last_R = float("nan")
+        last_state_im1 = state_i
+        last_info: dict = {}
+        for newton_iter in range(40):
+            R, state_im1, info = _segment_residual_backward(
+                P_im1, fluid, pipe, x_im1, x_i, state_i, h_stag, mdot,
+                friction_model,
+            )
+            last_R = R
+            last_state_im1 = state_im1
+            last_info = info
+            last_info["n_iter"] = newton_iter + 1
+            # Tolerance: 1e-6 relative on segment ΔP. Loose enough that
+            # FD noise doesn't trip us, tight enough for the engineering
+            # accuracy we need.
+            seg_dP_scale = max(abs(state_i.P), 1e3)
+            if abs(R) < 1e-6 * seg_dP_scale:
+                converged = True
+                break
+            # FD derivative w.r.t. P_{i-1}.
+            dP_probe = max(1e-6 * P_im1, 1.0)
+            R_probe, _, _ = _segment_residual_backward(
+                P_im1 + dP_probe, fluid, pipe, x_im1, x_i, state_i,
+                h_stag, mdot, friction_model,
+            )
+            dR_dP = (R_probe - R) / dP_probe
+            if abs(dR_dP) < 1e-30:
+                break
+            step = -R / dR_dP
+            # Damped step, capped at 50% of current pressure.
+            if step > 0.5 * P_im1:
+                step = 0.5 * P_im1
+            elif step < -0.5 * P_im1:
+                step = -0.5 * P_im1
+            P_im1 += step
+            if P_im1 < 100.0:
+                P_im1 = 100.0  # 1 mbar floor.
+
+        if not converged:
+            # Fallback: accept loose convergence at 1e-3 relative; mirrors
+            # forward solve_segment's fallback band.
+            seg_dP_scale = max(abs(state_i.P), 1e3)
+            if abs(last_R) >= 1e-3 * seg_dP_scale:
+                raise SegmentConvergenceError(
+                    f"march_ivp_backward segment Newton failed at "
+                    f"x=[{x_im1:.3f}, {x_i:.3f}] m: |R| = {abs(last_R):.3e} "
+                    f"Pa, scale = {seg_dP_scale:.3e} Pa."
+                )
+
+        rev_x.append(x_im1)
+        rev_states.append(last_state_im1)
+        rev_A.append(A_seg)
+        rev_Re.append(last_info.get("Re", float("nan")))
+        rev_seg_info.append(last_info)
+
+        state_i = last_state_im1
+
+        if (
+            cancel_event is not None
+            and seg_idx % 10 == 0
+            and cancel_event.is_set()
+        ):
+            raise SolverCancelled(
+                "march_ivp_backward cancelled at segment "
+                f"{n - seg_idx + 1}/{n}."
+            )
+
+    # Reverse to inlet→outlet order so the PipeResult contract matches
+    # forward marches (callers iterate from x=0 to x=L).
+    x_list = list(reversed(rev_x))
+    states = list(reversed(rev_states))
+    A_list = list(reversed(rev_A))
+    Re_list = list(reversed(rev_Re))
+    seg_info_list = list(reversed(rev_seg_info))
+
+    elapsed = time.time() - t0
+    bc = {
+        "P_outlet": P_outlet,
+        "h_stag": h_stag,
+        "mdot": mdot,
+        "mode": "IVP_backward",
+    }
+    opts = {
+        "n_segments": n,
+        "friction_model": friction_model,
+        "march_direction": "backward",
+    }
+    return _build_result(
+        x_list, states, A_list, Re_list, seg_info_list,
+        mdot=mdot, choked=False, x_choke=None,
+        fluid=fluid, pipe=pipe, bc=bc, opts=opts,
+        elapsed=elapsed, n_adaptive=0,
+        section_transitions=[],
+        march_direction="backward",
     )
 
 

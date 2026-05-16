@@ -81,6 +81,20 @@ class HEMConsistencyWarning(UserWarning):
     pass
 
 
+class BackwardMarchDiabaticNotSupported(GasPipeError):
+    """Backward march for a pipe downstream of a choke point requires
+    adiabatic conditions in v1.
+
+    The pipe has at least one section with ``overall_U > 0``, which
+    would violate the ``h_stag = const`` invariant that backward
+    integration relies on (T at each station inferred from h_stag and
+    P, rather than integrated via the energy ODE). Either set
+    ``overall_U = 0`` on that section for v1, or wait for the diabatic
+    extension (forward-T-backward-P iteration).
+    """
+    pass
+
+
 class OverChokedError(GasPipeError):
     """Raised by Device.solve when mdot exceeds A_vc · G_max at (P_stag, T_stag).
 
