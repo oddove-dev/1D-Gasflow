@@ -292,24 +292,28 @@ class TestSinglePipeRegression:
         )
 
 
-def test_multi_element_bvpchoked_carries_populated_chainresult() -> None:
-    """User-discovered: Pipe → Device → Pipe at infeasible BCs must yield
-    a :class:`BVPChoked` whose ``result`` is the canonical choke-limited
-    march (i.e. ``P_last_cell`` at the device-choke ceiling, ABOVE the
-    user's target).
+def test_multi_element_choked_device_backward_pipe2_matches_BC() -> None:
+    """User-discovered: Pipe → Device → Pipe at low P_last_cell BC.
 
-    Pre-fix symptom: ``BVPChoked.result.results == []`` with NaN
-    ``P_last_cell`` / ``T_out`` and ``mdot_critical`` reported as
-    ~4868 kg/s for an orifice that physically limits to sub-kg/s.
+    Pre-v0: BVPChoked.result.results == [] with NaN aggregate fields.
+    v0 (commit e9f9285): BVPChoked carrying a forward-marched
+    ceiling result whose P_last_cell was set by Borda-Carnot recovery
+    (~30 bara) rather than the user's BC (2 bara) — physically wrong.
+    v1 (commit 2 of backward-march sequence): the chain solver
+    switches to backward-downstream-march mode for the pipe
+    downstream of the choked device. Pipe 2 owns its P_first_cell
+    via backward integration from the chain BC, decoupling the
+    downstream pipe state from the Borda-Carnot transition (which
+    stays attached to the DeviceResult as a diagnostic).
 
-    Post-fix expectation: the device-bottleneck recovery in
-    :func:`_mode1_brentq` walks down to find a feasible probe, marches
-    once at just-below the device's ``max_mdot`` ceiling for the
-    canonical choke-limited profile, and raises ``BVPChoked`` carrying
-    that profile when the target is below the ceiling-limited
-    ``P_last_cell``. ``mdot_critical`` equals the device ceiling and
-    ``result.P_last_cell`` is the (finite) lowest-achievable last-cell
-    pressure, which is strictly greater than the user-requested target.
+    Expected output:
+      - solve_chain returns a normal ChainResult (no BVPChoked)
+      - choked == True with kind == "device_choke_downstream_backward"
+      - mdot at the device choke ceiling (sub-kg/s for this orifice)
+      - pipe 2 march_direction == "backward"
+      - pipe 2 outlet == target P_last_cell
+      - pipe 2 inlet ≈ outlet (negligible friction at the choke-
+        limited mdot in the 400 mm downstream pipe)
     """
     import numpy as np
     from gas_pipe.chain import ChainResult
@@ -325,74 +329,51 @@ def test_multi_element_bvpchoked_carries_populated_chainresult() -> None:
     )])
     chain = ChainSpec(elements=[pipe_up, device, pipe_down])
 
-    target = 2e5  # 2 bara — below the device choke-limited P_last_cell
-    with pytest.raises(BVPChoked) as excinfo:
-        solve_chain(
-            chain, fluid, T_in=373.15,
-            P_in=50e5, P_last_cell=target,
-            eos_mode="direct",
-        )
+    target = 2e5  # 2 bara — far below Borda-Carnot recovery (~30 bara)
+    result = solve_chain(
+        chain, fluid, T_in=373.15,
+        P_in=50e5, P_last_cell=target,
+        eos_mode="direct",
+    )
 
-    exc = excinfo.value
-    assert isinstance(exc.result, ChainResult), (
-        f"BVPChoked.result must be ChainResult; "
-        f"got {type(exc.result).__name__}"
-    )
-    assert len(exc.result.results) >= 1, (
-        "ChainResult.results is empty; expected at least pipe 1's "
-        "real march profile from the canonical ceiling march."
-    )
-    first = exc.result.results[0]
-    assert isinstance(first, PipeResult), (
-        f"First chain element should be a PipeResult; "
-        f"got {type(first).__name__}"
-    )
-    assert np.all(np.isfinite(first.P)) and np.all(np.isfinite(first.T)), (
-        "Pipe 1's P / T arrays carry NaNs; the canonical ceiling "
-        "march should produce a clean profile."
-    )
-    # Headline check: the result must show the actual lowest-attainable
-    # P_last_cell (above the user target, since the target is unreachable).
-    assert math.isfinite(exc.result.P_last_cell), (
-        f"ChainResult.P_last_cell={exc.result.P_last_cell!r} is non-"
-        "finite; expected the canonical ceiling-limited last-cell "
-        "pressure."
-    )
-    assert exc.result.P_last_cell > target, (
-        f"ChainResult.P_last_cell={exc.result.P_last_cell/1e5:.3f} bara "
-        f"is at-or-below target {target/1e5:.3f} bara — that would mean "
-        "the BC IS reachable and BVPChoked should not have been raised."
-    )
-    # mdot_critical should equal the device's HEM ceiling.
-    assert 0.0 < exc.mdot_critical < 10.0, (
-        f"mdot_critical = {exc.mdot_critical:.3f} kg/s is out of range; "
-        "expected sub-kg/s order matching the device's HEM choke "
-        "ceiling."
-    )
-    diag = exc.result.choke_diagnostics
-    assert diag is not None, (
-        "ChainResult.choke_diagnostics must be populated so callers "
-        "can identify the bottleneck."
-    )
-    assert diag["kind"] == "device_over_choked", (
-        f"choke_diagnostics.kind = {diag['kind']!r}; "
-        "expected 'device_over_choked' since the device is the "
-        "choke bottleneck."
-    )
-    assert isinstance(diag["element_index"], int)
+    assert isinstance(result, ChainResult)
+    assert result.choked is True
+    assert len(result.results) == 3
+    # Chain end pressure matches BC up to backward-Newton tolerance.
+    assert result.P_last_cell == pytest.approx(target, abs=200.0)
+    # mdot at the device's HEM choke ceiling.
+    assert 0.0 < result.mdot < 5.0
+    # Pipe 1: forward-marched, no choke.
+    pipe1 = result.results[0]
+    assert isinstance(pipe1, PipeResult)
+    assert pipe1.march_direction == "forward"
+    assert not pipe1.choked
+    # Pipe 2: backward-marched, all finite, outlet matches BC.
+    pipe2 = result.results[2]
+    assert isinstance(pipe2, PipeResult)
+    assert pipe2.march_direction == "backward"
+    assert np.all(np.isfinite(pipe2.P))
+    assert np.all(np.isfinite(pipe2.T))
+    assert pipe2.P[-1] == pytest.approx(target, abs=200.0)
+    # At sub-kg/s mdot in a 400 mm pipe, friction is negligible; the
+    # backward-implied inlet should be within ~0.5% of the outlet.
+    rel_dP = abs(pipe2.P[0] - pipe2.P[-1]) / pipe2.P[-1]
+    assert rel_dP < 5e-3
+    # Diagnostic structure.
+    diag = result.choke_diagnostics
+    assert diag is not None
+    assert diag["kind"] == "device_choke_downstream_backward"
+    assert diag["element_index"] == 1
     assert diag["element_name"] == "V-orifice"
     assert diag["max_mdot"] > 0.0
-    # mdot_critical should match the device's HEM ceiling within
-    # numerical tolerance.
-    assert exc.mdot_critical == pytest.approx(diag["max_mdot"], rel=1e-2)
+    assert diag["P_throat"] > target  # throat at sonic well above BC
 
 
-def test_multi_element_bvpchoked_distinct_geometry() -> None:
-    """Same device-bottleneck pattern at a different geometry scale.
+def test_multi_element_choked_device_backward_distinct_geometry() -> None:
+    """Same backward-march pattern at a different geometry scale.
 
-    Guards against the recovery being too narrowly tuned to the
-    user-discovered repro case. Smaller upstream pipe, smaller device,
-    different BCs — same expected behaviour.
+    Smaller upstream pipe, smaller device, different BCs — confirms the
+    v1 backward-march path isn't tuned to the user-discovered repro.
     """
     import numpy as np
     from gas_pipe.chain import ChainResult
@@ -409,27 +390,25 @@ def test_multi_element_bvpchoked_distinct_geometry() -> None:
     chain = ChainSpec(elements=[pipe_up, device, pipe_down])
 
     target = 1e5
-    with pytest.raises(BVPChoked) as excinfo:
-        solve_chain(
-            chain, fluid, T_in=320.0,
-            P_in=30e5, P_last_cell=target,
-            eos_mode="direct",
-        )
+    result = solve_chain(
+        chain, fluid, T_in=320.0,
+        P_in=30e5, P_last_cell=target,
+        eos_mode="direct",
+    )
 
-    exc = excinfo.value
-    assert isinstance(exc.result, ChainResult)
-    assert len(exc.result.results) >= 1
-    first = exc.result.results[0]
-    assert isinstance(first, PipeResult)
-    assert np.all(np.isfinite(first.P))
-    assert math.isfinite(exc.result.P_last_cell)
-    assert exc.result.P_last_cell > target
-    assert 0.0 < exc.mdot_critical < 10.0
-    diag = exc.result.choke_diagnostics
+    assert isinstance(result, ChainResult)
+    assert result.choked is True
+    assert result.P_last_cell == pytest.approx(target, abs=200.0)
+    assert 0.0 < result.mdot < 5.0
+    pipe2 = result.results[2]
+    assert isinstance(pipe2, PipeResult)
+    assert pipe2.march_direction == "backward"
+    assert np.all(np.isfinite(pipe2.P))
+    assert pipe2.P[-1] == pytest.approx(target, abs=200.0)
+    diag = result.choke_diagnostics
     assert diag is not None
-    assert diag["kind"] == "device_over_choked"
+    assert diag["kind"] == "device_choke_downstream_backward"
     assert diag["element_name"] == "V-small"
-    assert exc.mdot_critical == pytest.approx(diag["max_mdot"], rel=1e-2)
 
 
 def test_multi_element_target_above_choke_ceiling_solves() -> None:

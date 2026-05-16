@@ -7,9 +7,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from .results import PipeResult
+    from .chain import ChainResult
     from .eos import GERGFluid
     from .geometry import Pipe
+    from .results import PipeResult
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,179 @@ def plot_profile(
     if show:
         import matplotlib.pyplot as _plt
         _plt.show()
+
+    return fig
+
+
+def plot_chain_profile(
+    result: "ChainResult",
+    fig=None,
+    show_device_markers: bool = True,
+) -> object:
+    """Plot a chain-aware flow profile spanning multiple pipes and devices.
+
+    Composition strategy:
+
+    - For a single-element chain (one :class:`Pipe`, no :class:`Device`),
+      delegates directly to :func:`plot_profile` so the output is
+      byte-identical to the pre-chain GUI.
+    - For multi-element chains, builds a synthetic merged-result by
+      concatenating each :class:`PipeResult`'s station arrays with the
+      cumulative chain-x offset, then calls :func:`plot_profile` on the
+      merged structure. Vertical purple dashed lines mark each Device
+      location, with a name label above the top axis row, when
+      ``show_device_markers`` is True.
+
+    Devices are zero-length in the chain coordinate — they sit at the
+    boundary between two pipe segments and introduce a discontinuity in
+    the property profiles.
+
+    Parameters
+    ----------
+    result : ChainResult
+    fig : matplotlib.figure.Figure or None
+    show_device_markers : bool
+        Toggle the vertical lines + labels for Device elements.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    from types import SimpleNamespace
+
+    from .device import DeviceResult
+    from .results import PipeResult
+
+    pipe_results = result.pipe_results
+    if (
+        len(result.results) == 1
+        and isinstance(result.results[0], PipeResult)
+    ):
+        return plot_profile(result.results[0], fig=fig)
+
+    # ---- Build merged station arrays + device positions ---------------
+    x_segs: list[np.ndarray] = []
+    P_segs: list[np.ndarray] = []
+    T_segs: list[np.ndarray] = []
+    rho_segs: list[np.ndarray] = []
+    Z_segs: list[np.ndarray] = []
+    u_segs: list[np.ndarray] = []
+    a_segs: list[np.ndarray] = []
+    M_segs: list[np.ndarray] = []
+    f_segs: list[np.ndarray] = []
+    T_dew_segs: list[np.ndarray] = []
+    metastable_segs: list[np.ndarray] = []
+
+    cum_x = 0.0
+    choked = False
+    x_choke_combined: float | None = None
+    had_meta = False
+    x_dew_cross: float | None = None
+    device_positions: list[tuple[float, str]] = []
+
+    for i, el_result in enumerate(result.results):
+        if isinstance(el_result, DeviceResult):
+            # Device sits at cum_x; record for marker overlay.
+            name = el_result.throat.A_vc  # no name on ThroatState; fall back
+            # Pull the configured Device name from the spec for the label.
+            device_obj = result.chain.elements[i]
+            label = (
+                getattr(device_obj, "name", "") or f"D{i + 1}"
+            )
+            device_positions.append((cum_x, label))
+            continue
+        pr = el_result  # PipeResult
+        x_shift = np.asarray(pr.x, dtype=float) + cum_x
+        x_segs.append(x_shift)
+        P_segs.append(np.asarray(pr.P, dtype=float))
+        T_segs.append(np.asarray(pr.T, dtype=float))
+        rho_segs.append(np.asarray(pr.rho, dtype=float))
+        Z_segs.append(np.asarray(pr.Z, dtype=float))
+        u_segs.append(np.asarray(pr.u, dtype=float))
+        a_segs.append(np.asarray(pr.a, dtype=float))
+        M_segs.append(np.asarray(pr.M, dtype=float))
+        # f is per-segment, length n-1 per pipe
+        f_segs.append(np.asarray(pr.f, dtype=float))
+        # T_dew may be missing or all-NaN for some pipes; pad with NaN to
+        # match station count.
+        T_dew_pipe = getattr(pr, "T_dew", None)
+        if T_dew_pipe is not None and len(T_dew_pipe) == len(pr.x):
+            T_dew_segs.append(np.asarray(T_dew_pipe, dtype=float))
+        else:
+            T_dew_segs.append(np.full(len(pr.x), np.nan))
+        meta_mask = getattr(pr, "metastable_mask", None)
+        if meta_mask is not None and len(meta_mask) == len(pr.x):
+            metastable_segs.append(np.asarray(meta_mask, dtype=bool))
+        else:
+            metastable_segs.append(np.zeros(len(pr.x), dtype=bool))
+        if pr.choked and pr.x_choke is not None:
+            choked = True
+            x_choke_combined = float(pr.x_choke) + cum_x
+        if getattr(pr, "had_metastable", False):
+            had_meta = True
+            x_dew = getattr(pr, "x_dewpoint_crossing", None)
+            if x_dew is not None and x_dew_cross is None:
+                x_dew_cross = float(x_dew) + cum_x
+        cum_x = float(x_shift[-1])
+
+    # Stitch f-arrays with a NaN "bridge" segment between adjacent pipes —
+    # the bridge represents the device gap, where friction is undefined.
+    # This keeps ``len(f_combined) == len(x_combined) - 1`` (the invariant
+    # plot_profile relies on for the ``step`` plot via ``x_mid``).
+    if f_segs:
+        bridged: list[np.ndarray] = [f_segs[0]]
+        for seg in f_segs[1:]:
+            bridged.append(np.array([np.nan]))
+            bridged.append(seg)
+        f_combined = np.concatenate(bridged)
+    else:
+        f_combined = np.array([])
+
+    merged = SimpleNamespace(
+        x=np.concatenate(x_segs),
+        P=np.concatenate(P_segs),
+        T=np.concatenate(T_segs),
+        rho=np.concatenate(rho_segs),
+        Z=np.concatenate(Z_segs),
+        u=np.concatenate(u_segs),
+        a=np.concatenate(a_segs),
+        M=np.concatenate(M_segs),
+        f=f_combined,
+        T_dew=(
+            np.concatenate(T_dew_segs)
+            if any(np.any(np.isfinite(seg)) for seg in T_dew_segs)
+            else None
+        ),
+        metastable_mask=np.concatenate(metastable_segs),
+        had_metastable=had_meta,
+        x_dewpoint_crossing=x_dew_cross,
+        choked=choked,
+        x_choke=x_choke_combined,
+    )
+
+    fig = plot_profile(merged, fig=fig)
+
+    if show_device_markers and device_positions:
+        for ax in fig.axes:
+            for x_dev, label in device_positions:
+                ax.axvline(
+                    x_dev, color="#7d3c98", linestyle=":", linewidth=1.2,
+                    alpha=0.7,
+                )
+        # Label devices above the top row of subplots.
+        top_axes = [ax for ax in fig.axes if ax.get_subplotspec().rowspan.start == 0]
+        if top_axes:
+            for x_dev, label in device_positions:
+                top_axes[0].annotate(
+                    label,
+                    xy=(x_dev, 1.0),
+                    xycoords=("data", "axes fraction"),
+                    xytext=(0, 4),
+                    textcoords="offset points",
+                    fontsize=8,
+                    color="#7d3c98",
+                    ha="center",
+                )
 
     return fig
 

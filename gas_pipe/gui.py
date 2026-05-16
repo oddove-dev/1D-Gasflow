@@ -177,6 +177,94 @@ def _build_pipe(pipe_kwargs: dict) -> Pipe:
     )
 
 
+# Human-readable labels for the canonical ``ChainResult.choke_diagnostics``
+# kinds emitted by chain.py. Anything not in this map renders as its raw
+# kind string so future additions still surface clearly.
+_CHOKE_KIND_LABELS: dict[str, str] = {
+    "device_choke_downstream_backward": (
+        "Device choke (downstream backward march)"
+    ),
+    "device_over_choked": "Device over-choked (BC unreachable)",
+    "fanno_pipe": "Pipe Fanno choke",
+    "fanno_pipe_during_march": "Pipe Fanno choke during march",
+    "eos_infeasible": "EOS infeasibility",
+    "boundary": "Boundary condition",
+}
+
+
+def _format_choke_diagnostics(diag: dict) -> str:
+    """Format a ``ChainResult.choke_diagnostics`` dict as a CHOKE
+    DIAGNOSTIC block for the chain summary tab.
+
+    Known fields are unit-converted (Pa → bara, K → °C with K in
+    parentheses) and shown with a fixed label column. Unknown fields
+    are appended as ``key = value`` lines so unrecognised keys still
+    surface instead of being silently dropped.
+    """
+    lines = ["CHOKE DIAGNOSTIC"]
+    known: set[str] = set()
+
+    def _emit(label: str, value: str) -> None:
+        lines.append(f"  {label:<14} {value}")
+
+    kind = diag.get("kind")
+    if kind is not None:
+        known.add("kind")
+        label = _CHOKE_KIND_LABELS.get(kind, str(kind))
+        _emit("Type:", label)
+
+    if "element_index" in diag or "element_name" in diag:
+        known.update({"element_index", "element_name"})
+        idx = diag.get("element_index")
+        name = diag.get("element_name")
+        if idx is not None:
+            suffix = f" ({name})" if name else ""
+            _emit("Element:", f"index {idx}{suffix}")
+        elif name:
+            _emit("Element:", str(name))
+
+    if "max_mdot" in diag:
+        known.add("max_mdot")
+        _emit("Max mdot:", f"{float(diag['max_mdot']):.3f} kg/s")
+
+    if "P_throat" in diag:
+        known.add("P_throat")
+        _emit("Throat P:", f"{float(diag['P_throat']) / 1e5:.3f} bara")
+
+    if "T_throat" in diag:
+        known.add("T_throat")
+        T_K = float(diag["T_throat"])
+        _emit("Throat T:", f"{T_K - 273.15:.2f} °C  ({T_K:.2f} K)")
+
+    if "P_stag" in diag:
+        known.add("P_stag")
+        _emit("Stag P:", f"{float(diag['P_stag']) / 1e5:.3f} bara")
+
+    if "T_stag" in diag:
+        known.add("T_stag")
+        T_K = float(diag["T_stag"])
+        _emit("Stag T:", f"{T_K - 273.15:.2f} °C  ({T_K:.2f} K)")
+
+    if "x_choke" in diag and diag["x_choke"] is not None:
+        known.add("x_choke")
+        _emit("x_choke:", f"{float(diag['x_choke']):.3f} m")
+
+    if "exception" in diag:
+        known.add("exception")
+        _emit("Exception:", str(diag["exception"]))
+
+    if "message" in diag:
+        known.add("message")
+        _emit("Message:", str(diag["message"]))
+
+    for key, value in diag.items():
+        if key in known:
+            continue
+        _emit(f"{key}:", repr(value))
+
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------------------
 # Skarv defaults (geometry / BC / solver)
 # ----------------------------------------------------------------------
@@ -190,13 +278,17 @@ _SKARV_GEOMETRY = {
 }
 
 _SKARV_BC = {
+    # 3-field BC layout: user fills exactly two of (P_in, P_last_cell,
+    # mdot), leaves the third blank. The Skarv default targets BVP
+    # Mode 1 (P_in + P_last_cell → mdot), so P_in and P_last_cell are
+    # filled and mdot is blank. The empty mdot field preserves the prior
+    # solve-for-mdot default behavior. ``P_last_cell`` is the per-pipe
+    # last-cell pressure — not a chain-level post-expansion BC; see the
+    # "Pressure terminology" section of CLAUDE.md.
     "P_in_bara": 50.0,
     "T_in_C": 100.0,
-    "mode": "BVP",
-    "mdot_kgs": 120.0,
-    # ``P_last_cell`` is the per-pipe last-cell pressure — not a chain-level
-    # post-expansion BC; see the "Pressure terminology" section of CLAUDE.md.
     "P_last_cell_bara": 2.0,
+    "mdot_kgs": "",  # blank → Mode 1 dispatched
 }
 
 _SKARV_SOLVER = {
@@ -388,16 +480,18 @@ class MainWindow:
             }],
         }]
         self.var_T_amb = tk.StringVar(value=str(_SKARV_GEOMETRY["ambient_T_C"]))
-        # BC
+        # BC — three input fields (P_in, P_last_cell, mdot); user fills
+        # exactly two and leaves the third blank. ``P_last_cell`` is the
+        # per-pipe last-cell pressure (not chain-level post-expansion;
+        # see CLAUDE.md "Pressure terminology"). Submit-time validation
+        # in _gather_inputs enforces the "exactly two" rule and dispatches
+        # the corresponding solve_chain mode.
         self.var_P_in = tk.StringVar(value=str(_SKARV_BC["P_in_bara"]))
         self.var_T_in = tk.StringVar(value=str(_SKARV_BC["T_in_C"]))
-        self.var_mode = tk.StringVar(value=str(_SKARV_BC["mode"]))
-        self.var_mdot = tk.StringVar(value=str(_SKARV_BC["mdot_kgs"]))
-        # ``P_last_cell`` is the per-pipe last-cell pressure — not a chain-
-        # level post-expansion BC; see CLAUDE.md "Pressure terminology".
         self.var_P_last_cell = tk.StringVar(
             value=str(_SKARV_BC["P_last_cell_bara"]),
         )
+        self.var_mdot = tk.StringVar(value=str(_SKARV_BC["mdot_kgs"]))
         # Solver
         # Discretization: split into adaptive + (linear N or dimensionless α).
         # Only one of n_seg / alpha is meaningful at a time, but we hold both
@@ -428,6 +522,19 @@ class MainWindow:
         self.var_status = tk.StringVar(value="idle")
         # Solver-options collapsed state
         self._solver_collapsed = tk.BooleanVar(value=False)
+        # Chain-aware view state (commit 2 Item 5).
+        # Show vertical purple dashed markers + name labels at device
+        # locations on the Profile plot. Default on; only matters for
+        # multi-element chains.
+        self._var_show_device_markers = tk.BooleanVar(value=True)
+        # Station-tab filter for multi-element chains. Combobox values are
+        # rebuilt on each chain populate so element-specific options like
+        # "Element 1", "Element 2", … appear in chain order.
+        self._var_station_filter = tk.StringVar(value="All")
+        # Last rendered multi-element ChainResult, retained so the marker
+        # toggle can re-render the Profile plot without re-solving. Reset
+        # to None for single-pipe results and over-choked placeholders.
+        self._last_chain_result: ChainResult | None = None
 
         # ---- Worker thread ----------------------------------------------
         # SolverWorker runs the solver off the Tk thread so the window
@@ -447,8 +554,7 @@ class MainWindow:
         self._build_menu()
         self._build_layout()
 
-        # Initial UI state
-        self._update_mode_visibility()
+        # (3-field BC layout — no mode toggle to initialize.)
 
     # ------------------------------------------------------------------
     # Menu
@@ -822,12 +928,139 @@ class MainWindow:
                 parent=self.root,
             )
         else:
-            # Device editor lands in commit 2.
-            raise NotImplementedError(
-                "Device editor is not yet implemented (commit 2 scope). "
-                "For now, default placeholder values "
-                f"(A_geom={el['A_geom_mm2']} mm², Cd={el['Cd']}) are used."
-            )
+            self._open_device_editor(idx)
+
+    def _open_device_editor(self, idx: int) -> None:
+        """Modal Device editor — Name, A_geom [mm²], Cd; live A_vc / A_down.
+
+        ``A_vc = Cd · A_geom`` is displayed live as the user types. ``A_down``
+        is read from the first section of the next Pipe in the chain (if any)
+        and the ratio ``A_vc / A_down`` is also shown — it lets the user
+        sanity-check the choke severity (ratio ≪ 1 means strong contraction).
+        Cancel discards edits; Save mutates ``_chain_elements[idx]`` in place.
+        """
+        el = self._chain_elements[idx]
+        assert el["kind"] == "device"
+        # Locate the next Pipe (downstream) for A_down display.
+        A_down_mm2: float | None = None
+        for j in range(idx + 1, len(self._chain_elements)):
+            other = self._chain_elements[j]
+            if other["kind"] == "pipe" and other.get("sections"):
+                id_mm = float(other["sections"][0]["id_mm"])
+                A_down_mm2 = math.pi * (id_mm / 2.0) ** 2
+                break
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Edit Device {idx + 1}")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+
+        var_name = tk.StringVar(value=str(el.get("name", "")))
+        var_A_geom = tk.StringVar(value=f"{float(el['A_geom_mm2']):g}")
+        var_Cd = tk.StringVar(value=f"{float(el['Cd']):g}")
+        var_A_vc = tk.StringVar(value="—")
+        var_ratio = tk.StringVar(value="—")
+
+        def _recompute(*_args: Any) -> None:
+            try:
+                A_geom = float(var_A_geom.get())
+                Cd = float(var_Cd.get())
+            except ValueError:
+                var_A_vc.set("—")
+                var_ratio.set("—")
+                return
+            A_vc = Cd * A_geom
+            var_A_vc.set(f"{A_vc:.3f} mm²")
+            if A_down_mm2 is not None and A_down_mm2 > 0.0:
+                var_ratio.set(f"{A_vc / A_down_mm2:.4f}")
+            else:
+                var_ratio.set("—")
+
+        var_A_geom.trace_add("write", _recompute)
+        var_Cd.trace_add("write", _recompute)
+        _recompute()
+
+        body = ttk.Frame(dlg, padding=12)
+        body.grid(row=0, column=0, sticky="nsew")
+        v = self._validate_cmd
+
+        ttk.Label(body, text="Name:").grid(row=0, column=0, sticky="e", pady=2)
+        ttk.Entry(body, textvariable=var_name, width=24).grid(
+            row=0, column=1, sticky="ew", pady=2,
+        )
+
+        ttk.Label(body, text="A_geom [mm²]:").grid(row=1, column=0, sticky="e", pady=2)
+        e_A = ttk.Entry(body, textvariable=var_A_geom, width=14,
+                        validate="key", validatecommand=v)
+        e_A.grid(row=1, column=1, sticky="w", pady=2)
+
+        ttk.Label(body, text="Cd:").grid(row=2, column=0, sticky="e", pady=2)
+        ttk.Entry(body, textvariable=var_Cd, width=14,
+                  validate="key", validatecommand=v).grid(
+            row=2, column=1, sticky="w", pady=2,
+        )
+
+        ttk.Separator(body, orient="horizontal").grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=(8, 4),
+        )
+        ttk.Label(body, text="A_vc = Cd · A_geom:").grid(
+            row=4, column=0, sticky="e", pady=2,
+        )
+        ttk.Label(body, textvariable=var_A_vc, foreground="#444444").grid(
+            row=4, column=1, sticky="w", pady=2,
+        )
+
+        A_down_label = (
+            f"{A_down_mm2:.3f} mm²" if A_down_mm2 is not None
+            else "—  (no downstream Pipe)"
+        )
+        ttk.Label(body, text="A_down (next Pipe ID):").grid(
+            row=5, column=0, sticky="e", pady=2,
+        )
+        ttk.Label(body, text=A_down_label, foreground="#444444").grid(
+            row=5, column=1, sticky="w", pady=2,
+        )
+        ttk.Label(body, text="A_vc / A_down:").grid(
+            row=6, column=0, sticky="e", pady=2,
+        )
+        ttk.Label(body, textvariable=var_ratio, foreground="#444444").grid(
+            row=6, column=1, sticky="w", pady=2,
+        )
+
+        buttons = ttk.Frame(dlg, padding=(12, 4, 12, 12))
+        buttons.grid(row=1, column=0, sticky="ew")
+
+        def _on_save() -> None:
+            try:
+                A_geom = _parse_positive_float(var_A_geom.get(), "A_geom")
+                Cd = _parse_positive_float(var_Cd.get(), "Cd")
+            except _InputValidationError as exc:
+                messagebox.showerror("Edit Device", str(exc), parent=dlg)
+                return
+            if Cd > 1.0:
+                if not messagebox.askyesno(
+                    "Edit Device",
+                    f"Cd = {Cd:g} exceeds 1.0. Physical discharge coefficients are "
+                    "typically ≤ 1. Continue anyway?",
+                    parent=dlg,
+                ):
+                    return
+            el["name"] = var_name.get().strip()
+            el["A_geom_mm2"] = A_geom
+            el["Cd"] = Cd
+            self._refresh_chain_tree()
+            dlg.destroy()
+
+        ttk.Button(buttons, text="Cancel", command=dlg.destroy).pack(
+            side="right", padx=(6, 0),
+        )
+        ttk.Button(buttons, text="Save", command=_on_save).pack(side="right")
+
+        dlg.grab_set()
+        e_A.focus_set()
+        # Wait until the user closes the modal before returning control to
+        # the caller — matches the rest of the GUI's modal dialogs.
+        self.root.wait_window(dlg)
 
     def _action_remove_element(self) -> None:
         """Remove the selected chain element."""
@@ -1031,31 +1264,8 @@ class MainWindow:
         v = self._validate_cmd
         _add_labeled_entry(f, 0, "Inlet P [bara]", self.var_P_in, v)
         _add_labeled_entry(f, 1, "Inlet T [°C]", self.var_T_in, v)
-
-        # Mode radio
-        mode_frame = ttk.Frame(f)
-        mode_frame.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 2))
-        ttk.Label(mode_frame, text="Mode:").pack(side="left", padx=(0, 6))
-        ttk.Radiobutton(
-            mode_frame, text="IVP (specify ṁ)",
-            variable=self.var_mode, value="IVP",
-            command=self._update_mode_visibility,
-        ).pack(side="left", padx=(0, 8))
-        ttk.Radiobutton(
-            mode_frame, text="BVP (specify P_last_cell)",
-            variable=self.var_mode, value="BVP",
-            command=self._update_mode_visibility,
-        ).pack(side="left")
-
-        # IVP / BVP conditional rows (separate Frames so we can grid_remove cleanly)
-        self._ivp_frame = ttk.Frame(f)
-        self._ivp_frame.columnconfigure(1, weight=1)
-        _add_labeled_entry(self._ivp_frame, 0, "Mass flow [kg/s]", self.var_mdot, v)
-
-        self._bvp_frame = ttk.Frame(f)
-        self._bvp_frame.columnconfigure(1, weight=1)
         e_pipe_end = _add_labeled_entry(
-            self._bvp_frame, 0, "Pipe end P [bara]", self.var_P_last_cell, v,
+            f, 2, "Pipe end P [bara]", self.var_P_last_cell, v,
         )
         _make_tooltip(
             e_pipe_end,
@@ -1064,11 +1274,18 @@ class MainWindow:
             "post-expansion BC is reserved for a future outlet-expansion "
             "model and is not yet coupled to the solver.",
         )
+        _add_labeled_entry(f, 3, "Mass flow [kg/s]", self.var_mdot, v)
 
-        # Place both at the same grid row; visibility toggled in
-        # _update_mode_visibility().
-        self._ivp_frame.grid(row=3, column=0, columnspan=2, sticky="ew")
-        self._bvp_frame.grid(row=3, column=0, columnspan=2, sticky="ew")
+        # Helper text describing the empty-field dispatch.
+        hint = ttk.Label(
+            f,
+            text=(
+                "Fill exactly two of (Inlet P, Pipe end P, Mass flow). "
+                "Leave the third blank to solve for it."
+            ),
+            wraplength=380, foreground="#555555", justify="left",
+        )
+        hint.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
         return f
 
     def _build_solver_section(self, parent: tk.Misc) -> ttk.Frame:
@@ -1382,6 +1599,18 @@ class MainWindow:
             side="left", padx=(0, 4)
         )
         ttk.Button(toolbar, text="Refresh", command=self._action_refresh_plot).pack(side="left")
+        # Chain-aware toggle: vertical markers at device positions on the
+        # Profile plot. Disabled until a multi-element ChainResult has been
+        # rendered (the populator re-enables it). Single-pipe results
+        # leave the checkbox inactive — there are no devices to mark.
+        self._chk_show_device_markers = ttk.Checkbutton(
+            toolbar,
+            text="Show device markers",
+            variable=self._var_show_device_markers,
+            command=self._on_show_device_markers_toggle,
+        )
+        self._chk_show_device_markers.pack(side="left", padx=(12, 0))
+        self._chk_show_device_markers.state(["disabled"])
 
         try:
             from matplotlib.figure import Figure
@@ -1414,6 +1643,21 @@ class MainWindow:
         )
         ttk.Button(toolbar, text="Copy as TSV", command=self._action_copy_tsv).pack(
             side="left"
+        )
+        # Chain-aware filter: hidden/disabled until a multi-element
+        # ChainResult populates the table. Values are rebuilt per-chain
+        # so "Element 1", "Element 2", … reflect the current chain order.
+        ttk.Label(toolbar, text="Show:").pack(side="left", padx=(12, 2))
+        self._cmb_station_filter = ttk.Combobox(
+            toolbar,
+            textvariable=self._var_station_filter,
+            values=("All",),
+            state="disabled",
+            width=14,
+        )
+        self._cmb_station_filter.pack(side="left")
+        self._cmb_station_filter.bind(
+            "<<ComboboxSelected>>", self._on_station_filter_change,
         )
 
         tv_frame = ttk.Frame(parent)
@@ -1528,15 +1772,6 @@ class MainWindow:
     # ------------------------------------------------------------------
     # Internal actions / state
     # ------------------------------------------------------------------
-    def _update_mode_visibility(self) -> None:
-        """Show the IVP or BVP conditional row based on the mode radio."""
-        if self.var_mode.get() == "IVP":
-            self._bvp_frame.grid_remove()
-            self._ivp_frame.grid()
-        else:
-            self._ivp_frame.grid_remove()
-            self._bvp_frame.grid()
-
     def _toggle_solver_section(self) -> None:
         if self._solver_collapsed.get():
             self._solver_inner.grid()
@@ -1679,37 +1914,62 @@ class MainWindow:
         else:
             pipe_kwargs = None
 
-        # Boundary conditions
-        P_in = _parse_positive_float(self.var_P_in.get(), "Inlet P") * 1e5
+        # Boundary conditions — three input fields with exactly-two
+        # dispatch. T_in is always required (forward temperature
+        # propagation regardless of which pressure is unknown).
         T_in_K = _parse_float(self.var_T_in.get(), "Inlet T") + 273.15
         if T_in_K <= 0.0:
             raise _InputValidationError(
                 f"Inlet T ({T_in_K - 273.15:.1f} °C) is below absolute zero."
             )
 
-        mode = self.var_mode.get()
-        if mode not in ("IVP", "BVP"):
-            raise _InputValidationError(f"Unknown mode {mode!r}.")
-        if mode == "IVP":
-            mdot = _parse_positive_float(self.var_mdot.get(), "Mass flow")
-            P_last_cell: float | None = None
-        else:
-            P_last_cell = _parse_positive_float(
-                self.var_P_last_cell.get(), "Pipe end P"
-            ) * 1e5
-            mdot = None
-            if P_last_cell >= P_in:
-                raise _InputValidationError(
-                    f"Pipe end P ({P_last_cell / 1e5:.2f} bara) must be lower "
-                    f"than Inlet P ({P_in / 1e5:.2f} bara)."
-                )
+        P_in_str = self.var_P_in.get().strip()
+        P_last_cell_str = self.var_P_last_cell.get().strip()
+        mdot_str = self.var_mdot.get().strip()
+        filled = [
+            name for name, val in (
+                ("Inlet P", P_in_str),
+                ("Pipe end P", P_last_cell_str),
+                ("Mass flow", mdot_str),
+            ) if val
+        ]
+        if len(filled) != 2:
+            raise _InputValidationError(
+                "Exactly two of (Inlet P, Pipe end P, Mass flow) must be "
+                f"specified. Got: {filled or 'none'}."
+            )
+
+        P_in = (
+            _parse_positive_float(P_in_str, "Inlet P") * 1e5
+            if P_in_str else None
+        )
+        P_last_cell = (
+            _parse_positive_float(P_last_cell_str, "Pipe end P") * 1e5
+            if P_last_cell_str else None
+        )
+        mdot = (
+            _parse_positive_float(mdot_str, "Mass flow")
+            if mdot_str else None
+        )
+
+        # Sanity: if both P_in and P_last_cell are given, Inlet P must be
+        # the higher one (forward flow direction). Other pairings cannot
+        # be cross-validated here without running the solver.
+        if (
+            P_in is not None
+            and P_last_cell is not None
+            and P_last_cell >= P_in
+        ):
+            raise _InputValidationError(
+                f"Pipe end P ({P_last_cell / 1e5:.2f} bara) must be lower "
+                f"than Inlet P ({P_in / 1e5:.2f} bara)."
+            )
 
         bc = {
             "P_in": P_in,
             "T_in": T_in_K,
-            "mode": mode,
-            "mdot": mdot,
             "P_last_cell": P_last_cell,
+            "mdot": mdot,
         }
 
         # Solver options — resolve discretization first since N depends on
@@ -1883,14 +2143,17 @@ class MainWindow:
         eos_kwargs = inputs["eos_kwargs"]
         discretization = inputs["discretization"]
 
-        # Map the legacy GUI BC mode to solve_chain keyword args.
-        # IVP → Mode 2 (P_in + mdot). BVP → Mode 1 (P_in + P_last_cell).
-        # Mode 3 (P_last_cell + mdot) is not yet wired through the GUI — the
-        # 3-field BC layout that exposes it lands in commit 2.
-        if bc["mode"] == "IVP":
-            chain_kwargs = {"P_in": bc["P_in"], "mdot": bc["mdot"]}
-        else:
-            chain_kwargs = {"P_in": bc["P_in"], "P_last_cell": bc["P_last_cell"]}
+        # The 3-field BC layout populates exactly two of (P_in,
+        # P_last_cell, mdot); the omitted field is None. Pass through to
+        # solve_chain which dispatches the mode from the keyword
+        # combination.
+        chain_kwargs = {
+            k: v for k, v in (
+                ("P_in", bc["P_in"]),
+                ("P_last_cell", bc["P_last_cell"]),
+                ("mdot", bc["mdot"]),
+            ) if v is not None
+        }
 
         first_pipe_D = float(chain.pipes[0].sections[0].inner_diameter)
 
@@ -1954,12 +2217,22 @@ class MainWindow:
             return
 
         bc = inputs["bc"]
-        if bc["mode"] != "BVP":
+        if bc["P_in"] is None or bc["P_last_cell"] is None:
             messagebox.showinfo(
                 "Verify table accuracy",
                 "Table-accuracy verification compares two BVP solves "
-                "(table interpolation vs direct EOS). Switch the mode "
-                "to BVP and try again.",
+                "(table interpolation vs direct EOS). Fill in both "
+                "Inlet P and Pipe end P, leave Mass flow blank, and try "
+                "again.",
+                parent=self.root,
+            )
+            return
+        if inputs["pipe_kwargs"] is None:
+            messagebox.showinfo(
+                "Verify table accuracy",
+                "Table-accuracy verification currently supports single-"
+                "pipe chains only. Remove Device elements (or extra "
+                "Pipes) and try again.",
                 parent=self.root,
             )
             return
@@ -2201,11 +2474,14 @@ class MainWindow:
             self._status_label.configure(foreground="#C42B1C")
 
         elif kind == "over_choked":
-            # Mode 2 / Mode 3 chain infeasibility. Tabs aren't populated
-            # (no ChainResult was produced); commit-2 will add a banner
-            # overlay; for commit-1 scaffolding the status bar carries
-            # the diagnostic so the user knows what happened.
+            # Mode 2 / Mode 3 chain infeasibility. No ChainResult is
+            # produced — the Summary tab carries the diagnostic banner,
+            # and Profile/Station are dimmed to a "No result" placeholder.
             _, exc, elapsed = msg
+            self._render_over_choked_summary(exc)
+            self._render_no_result_placeholder(
+                "No result — request exceeds device capacity"
+            )
             self.var_status.set(
                 f"[OVER-CHOKED] device '{exc.device_name or '?'}' "
                 f"(index {exc.device_index}) max ṁ = {exc.max_mdot:.3f} "
@@ -2291,6 +2567,25 @@ class MainWindow:
             inputs = self._gather_inputs()
         except _InputValidationError as exc:
             messagebox.showerror("Invalid input", str(exc), parent=self.root)
+            return
+
+        if inputs["pipe_kwargs"] is None:
+            messagebox.showinfo(
+                "Plateau sweep",
+                "Plateau sweep currently supports single-pipe chains "
+                "only. Remove Device elements (or extra Pipes) and try "
+                "again.",
+                parent=self.root,
+            )
+            return
+        if inputs["bc"]["P_in"] is None:
+            messagebox.showinfo(
+                "Plateau sweep",
+                "Plateau sweep sweeps Pipe end P from a given Inlet P. "
+                "Fill in Inlet P (and Mass flow or Pipe end P) and try "
+                "again.",
+                parent=self.root,
+            )
             return
 
         try:
@@ -2465,35 +2760,341 @@ class MainWindow:
         # Plateau Sweep tab is populated separately by the sweep button.
 
     def _populate_multi_element_placeholder(self, result: ChainResult) -> None:
-        """Stub renderer for multi-element ChainResult (commit 1 scope).
+        """Render a multi-element :class:`ChainResult` into the result tabs.
 
-        Replaces the result tabs with a "coming in commit 2" message and
-        a minimal text summary so the user can verify the solver actually
-        ran. Full per-element rendering is commit-2 work.
+        Summary tab: chain totals header + per-element blocks.
+        Profile tab: chain-coordinate profile via :func:`plot_chain_profile`.
+        Station tab: extended with an Element column and a per-element
+        filter Combobox.
         """
+        self._last_chain_result = result
+        self._populate_chain_summary_tab(result)
+        self._populate_chain_profile_tab(result)
+        self._populate_chain_table_tab(result)
+
+    def _populate_chain_summary_tab(self, result: ChainResult) -> None:
+        """Chain summary: totals header + per-element blocks in chain order."""
+        from .device import DeviceResult
+        from .results import PipeResult
+
+        bcs = result.boundary_conditions or {}
+        given = bcs.get("given", ())
         n_pipes = len(result.pipe_results)
         n_devices = len(result.device_results)
-        msg = (
-            f"Multi-element chain solved: {n_pipes} pipe(s), "
-            f"{n_devices} device(s).\n"
-            f"  mdot = {result.mdot:.4f} kg/s\n"
-            f"  P_in = {result.P_in/1e5:.3f} bara → "
-            f"P_last_cell = {result.P_last_cell/1e5:.3f} bara\n"
-            f"  T_in = {result.T_in-273.15:.2f} °C → "
-            f"T_out = {result.T_out-273.15:.2f} °C\n"
-            f"  Elapsed: {result.elapsed:.1f} s\n\n"
-            "Multi-element tab rendering (per-element blocks, chain profile,\n"
-            "device-aware station table) is implemented in commit 2 of "
-            "Item 5."
+        dP_total = (result.P_in - result.P_last_cell) / 1e5  # bara
+
+        header_lines = [
+            "=" * 78,
+            f"CHAIN ANALYSIS — {n_pipes} pipe(s), {n_devices} device(s)",
+            "=" * 78,
+            f"  Boundary conditions given: {', '.join(given) if given else '(?)'}",
+            f"  ṁ            = {result.mdot:.4f} kg/s",
+            f"  Inlet P      = {result.P_in / 1e5:.3f} bara  (chain BC)",
+            f"  Last cell P  = {result.P_last_cell / 1e5:.3f} bara  "
+            "(last pipe, chain result)",
+            f"  ΔP_total     = {dP_total:.3f} bara",
+            f"  T_in         = {result.T_in - 273.15:.2f} °C",
+            f"  T_out        = {result.T_out - 273.15:.2f} °C",
+            f"  Choked       = {result.choked}",
+            f"  Elapsed      = {result.elapsed:.2f} s",
+        ]
+        if result.choke_diagnostics:
+            header_lines.append("")
+            header_lines.append(_format_choke_diagnostics(
+                result.choke_diagnostics
+            ))
+        header_lines.append("")
+
+        blocks: list[str] = ["\n".join(header_lines)]
+        for i, el_result in enumerate(result.results, start=1):
+            if isinstance(el_result, PipeResult):
+                blocks.append(f"[Pipe {i}]\n" + el_result.summary())
+            elif isinstance(el_result, DeviceResult):
+                throat = el_result.throat
+                transition = el_result.transition
+                inlet = transition.state_inlet
+                device_obj = result.chain.elements[i - 1]
+                name = getattr(device_obj, "name", "") or "(unnamed)"
+                A_geom_mm2 = getattr(device_obj, "A_geom", 0.0) * 1e6
+                Cd = getattr(device_obj, "Cd", 0.0)
+                blocks.append(
+                    f"[Device {i} — {name}]\n"
+                    f"  Geometry:      A_geom = {A_geom_mm2:.3f} mm², "
+                    f"Cd = {Cd:.3f}, A_vc = {throat.A_vc * 1e6:.3f} mm²\n"
+                    f"  Throat:        P = {throat.P / 1e5:.3f} bara, "
+                    f"T = {throat.T - 273.15:.2f} °C\n"
+                    f"                 ρ = {throat.rho:.3f} kg/m³, "
+                    f"u = {throat.u:.2f} m/s\n"
+                    f"                 M = {throat.M:.4f}  choked = {throat.choked}\n"
+                    f"                 ṁ = {throat.mdot:.4f} kg/s, "
+                    f"G = {throat.G:.1f} kg/m²/s\n"
+                    f"                 c_HEM = {throat.c_HEM:.2f} m/s\n"
+                    f"  Transition:    P_inlet = {inlet.P / 1e5:.3f} bara, "
+                    f"T_inlet = {inlet.T - 273.15:.2f} °C\n"
+                    f"                 u_inlet = {transition.u_inlet:.2f} m/s\n"
+                    f"                 ΔP = {transition.dP / 1e5:+.4f} bara "
+                    "(positive = recovery)\n"
+                    f"                 η_dissipation = "
+                    f"{transition.eta_dissipation:.4f}\n"
+                    f"  Diagnostics:   dh_static = {el_result.dh_static:+.1f} J/kg\n"
+                    f"                 ds        = {el_result.ds:+.4f} J/(kg·K)"
+                )
+
+        text = "\n\n".join(blocks)
+        self._summary_text.configure(state="normal")
+        self._summary_text.delete("1.0", "end")
+        if result.choked:
+            banner = (
+                "=" * 78 + "\n"
+                "⚠ CHAIN CHOKED — see choke diagnostic above\n"
+                + "=" * 78 + "\n\n"
+            )
+            self._summary_text.insert("end", banner, "banner_significant")
+        self._summary_text.insert("end", text)
+        self._summary_text.configure(state="disabled")
+        self._summary_text.see("1.0")
+
+    def _populate_chain_profile_tab(self, result: ChainResult) -> None:
+        """Profile tab: chain-aware plot via :func:`plot_chain_profile`.
+
+        Enables the "Show device markers" checkbox iff the chain actually
+        contains at least one Device — single-element chains and pure-Pipe
+        multi-element chains have nothing to mark.
+        """
+        if self._figure is None or self._figure_canvas is None:
+            return
+        from .diagnostics import plot_chain_profile
+
+        has_devices = bool(result.device_results)
+        if has_devices:
+            self._chk_show_device_markers.state(["!disabled"])
+        else:
+            self._chk_show_device_markers.state(["disabled"])
+        show_markers = bool(
+            has_devices and self._var_show_device_markers.get()
+        )
+        self._figure.clear()
+        # Restore default background in case a no-result placeholder
+        # previously tinted the figure gray.
+        self._figure.set_facecolor("white")
+        plot_chain_profile(
+            result, fig=self._figure, show_device_markers=show_markers,
+        )
+        self._figure_canvas.draw()
+
+    def _populate_chain_table_tab(self, result: ChainResult) -> None:
+        """Station table extended with an Element column and per-element filter."""
+        from .device import DeviceResult
+        from .results import PipeResult
+
+        element_options = tuple(
+            f"Element {i}" for i in range(1, len(result.results) + 1)
+        )
+        self._configure_table_for_chain(element_options)
+
+        # Build the row list once, capturing element_index for filtering.
+        self._chain_table_rows: list[dict] = []
+        chain_x = 0.0
+        for i, el_result in enumerate(result.results, start=1):
+            if isinstance(el_result, PipeResult):
+                df = el_result.to_dataframe()
+                for j in range(len(df)):
+                    self._chain_table_rows.append({
+                        "element": f"P{i}",
+                        "element_index": i,
+                        "kind": "pipe",
+                        "x": float(df["x_m"].iloc[j]) + chain_x,
+                        "P_bara": float(df["P_bara"].iloc[j]),
+                        "T_C": float(df["T_C"].iloc[j]),
+                        "rho": float(df["rho_kgm3"].iloc[j]),
+                        "u": float(df["u_ms"].iloc[j]),
+                        "a": float(df["a_ms"].iloc[j]),
+                        "M": float(df["M"].iloc[j]),
+                        "Re": float(df["Re"].iloc[j]),
+                        "Z": float(df["Z"].iloc[j]),
+                        "mu_JT": float(df["mu_JT_Kbar"].iloc[j]),
+                    })
+                chain_x += float(df["x_m"].iloc[-1])
+            elif isinstance(el_result, DeviceResult):
+                throat = el_result.throat
+                inlet = el_result.transition.state_inlet
+                u_inlet = el_result.transition.u_inlet
+                # Two rows per Device: throat conditions + inlet (post-transition).
+                self._chain_table_rows.append({
+                    "element": f"D{i} throat",
+                    "element_index": i,
+                    "kind": "device",
+                    "x": chain_x,
+                    "P_bara": throat.P / 1e5,
+                    "T_C": throat.T - 273.15,
+                    "rho": throat.rho,
+                    "u": throat.u,
+                    "a": throat.c_HEM,
+                    "M": throat.M,
+                    "Re": float("nan"),
+                    "Z": float("nan"),
+                    "mu_JT": float("nan"),
+                })
+                self._chain_table_rows.append({
+                    "element": f"D{i} inlet",
+                    "element_index": i,
+                    "kind": "device",
+                    "x": chain_x,
+                    "P_bara": inlet.P / 1e5,
+                    "T_C": inlet.T - 273.15,
+                    "rho": inlet.rho,
+                    "u": u_inlet,
+                    "a": inlet.a,
+                    "M": u_inlet / inlet.a if inlet.a > 0 else float("nan"),
+                    "Re": float("nan"),
+                    "Z": inlet.Z,
+                    "mu_JT": inlet.mu_JT * 1e5,  # K/Pa → K/bar
+                })
+
+        self._refresh_chain_table_view()
+
+    def _refresh_chain_table_view(self) -> None:
+        """Re-render the station Treeview applying the current filter selection."""
+        tv = self._station_tree
+        for item in tv.get_children():
+            tv.delete(item)
+        rows = getattr(self, "_chain_table_rows", [])
+        filter_sel = (
+            self._var_station_filter.get()
+            if getattr(self, "_var_station_filter", None) else "All"
+        )
+        for r in rows:
+            if filter_sel == "Pipes only" and r["kind"] != "pipe":
+                continue
+            if filter_sel == "Devices only" and r["kind"] != "device":
+                continue
+            if filter_sel.startswith("Element ") and (
+                f"Element {r['element_index']}" != filter_sel
+            ):
+                continue
+            tv.insert(
+                "", "end",
+                values=(
+                    r["element"],
+                    f"{r['x']:.3f}",
+                    f"{r['P_bara']:.3f}",
+                    f"{r['T_C']:.1f}",
+                    f"{r['rho']:.2f}",
+                    f"{r['u']:.2f}",
+                    f"{r['a']:.1f}",
+                    f"{r['M']:.4f}",
+                    "—" if math.isnan(r["Re"]) else f"{r['Re']:.2e}",
+                    "—" if math.isnan(r["Z"]) else f"{r['Z']:.4f}",
+                    "—" if math.isnan(r["mu_JT"]) else f"{r['mu_JT']:.4f}",
+                ),
+            )
+
+    def _render_over_choked_summary(self, exc: OverChokedError) -> None:
+        """Write the OverChokedError diagnostic into the Summary tab.
+
+        Mode 2 / Mode 3 over-choke is structurally different from a Mode 1
+        BVPChoked — we have no PipeResult/ChainResult to render — so the
+        Summary tab is replaced wholesale with the over-choke banner +
+        diagnostic block. The user keeps enough context to retune the
+        request (raise upstream P_in, lower mdot, enlarge A_geom).
+        """
+        banner = (
+            "=" * 78 + "\n"
+            "⚠ OVER-CHOKED — request exceeds device capacity (no result)\n"
+            + "=" * 78 + "\n\n"
+        )
+        device_name = exc.device_name or "(unnamed)"
+        body = (
+            f"Device:            #{exc.device_index} — {device_name}\n"
+            f"Max ṁ (choked):    {exc.max_mdot:.4f} kg/s\n"
+            f"Attempted ṁ:       {exc.attempted_mdot:.4f} kg/s\n"
+            f"Shortfall:         "
+            f"{exc.attempted_mdot - exc.max_mdot:+.4f} kg/s "
+            f"({(exc.attempted_mdot / exc.max_mdot - 1.0) * 100:+.1f}%)\n"
+            "\n"
+            "Try one of:\n"
+            "  • Lower the requested mass flow (Mode 1: drop P_in or raise P_last_cell)\n"
+            "  • Raise upstream pressure P_in (Mode 2)\n"
+            "  • Enlarge device A_geom (or raise Cd if appropriate)\n"
         )
         self._summary_text.configure(state="normal")
         self._summary_text.delete("1.0", "end")
-        self._summary_text.insert("end", msg)
+        self._summary_text.insert("end", banner, "banner_significant")
+        self._summary_text.insert("end", body)
         self._summary_text.configure(state="disabled")
         self._summary_text.see("1.0")
-        # Leave profile / station tabs untouched — they show whatever was
-        # last rendered (typically the previous single-pipe run, or a
-        # blank state for a fresh session).
+
+    def _render_no_result_placeholder(self, message: str) -> None:
+        """Render the Profile and Station tabs with a "no result" placeholder.
+
+        Used when :class:`OverChokedError` produces no ``ChainResult`` to
+        render (Mode 2 / Mode 3 infeasibility). Plateau Sweep tab is
+        independent and left untouched.
+        """
+        if self._figure is not None:
+            self._figure.clear()
+            ax = self._figure.add_subplot(111)
+            ax.text(
+                0.5, 0.5, message,
+                transform=ax.transAxes, ha="center", va="center",
+                color="#888888", fontsize=12,
+            )
+            ax.set_axis_off()
+            self._figure.set_facecolor("#f4f4f4")
+            if self._figure_canvas is not None:
+                self._figure_canvas.draw()
+        tv = self._station_tree
+        for item in tv.get_children():
+            tv.delete(item)
+        self._chain_table_rows = []
+        self._last_chain_result = None
+        self._chk_show_device_markers.state(["disabled"])
+        self._cmb_station_filter.configure(values=("All",), state="disabled")
+        self._var_station_filter.set("All")
+
+    def _configure_table_for_chain(self, element_options: tuple[str, ...]) -> None:
+        """Reconfigure the station Treeview to add a leading Element column.
+
+        Combobox values are set to ``("All", "Pipes only", "Devices only",
+        *element_options)`` and the widget is enabled. Idempotent — safe
+        to call repeatedly across chain populates.
+        """
+        tv = self._station_tree
+        col_ids = ("element", *(c[0] for c in _STATION_COLUMNS))
+        tv.configure(columns=col_ids)
+        tv.heading("element", text="Element")
+        tv.column("element", width=80, anchor="w", stretch=False)
+        for cid, label in _STATION_COLUMNS:
+            tv.heading(cid, text=label)
+            tv.column(cid, width=90, anchor="e")
+        values = ("All", "Pipes only", "Devices only", *element_options)
+        self._cmb_station_filter.configure(values=values, state="readonly")
+        if self._var_station_filter.get() not in values:
+            self._var_station_filter.set("All")
+
+    def _configure_table_for_single_pipe(self) -> None:
+        """Restore the legacy 10-column station Treeview layout.
+
+        Disables and resets the filter Combobox. Idempotent.
+        """
+        tv = self._station_tree
+        col_ids = tuple(c[0] for c in _STATION_COLUMNS)
+        tv.configure(columns=col_ids)
+        for cid, label in _STATION_COLUMNS:
+            tv.heading(cid, text=label)
+            tv.column(cid, width=90, anchor="e")
+        self._cmb_station_filter.configure(values=("All",), state="disabled")
+        self._var_station_filter.set("All")
+
+    def _on_show_device_markers_toggle(self) -> None:
+        """Redraw the Profile plot when the marker checkbox is toggled."""
+        if self._last_chain_result is None:
+            return
+        self._populate_chain_profile_tab(self._last_chain_result)
+
+    def _on_station_filter_change(self, _event: tk.Event | None = None) -> None:
+        """Re-apply the station-table filter when the Combobox selection changes."""
+        self._refresh_chain_table_view()
 
     @staticmethod
     def _classify_severity(result: "PipeResult") -> tuple[str | None, str | None]:
@@ -2542,11 +3143,19 @@ class MainWindow:
             return
         from .diagnostics import plot_profile
 
+        # Single-pipe path: no devices to mark, disable the toggle so the
+        # state cannot drift across runs.
+        self._chk_show_device_markers.state(["disabled"])
+        self._last_chain_result = None
         self._figure.clear()
+        self._figure.set_facecolor("white")
         plot_profile(result, fig=self._figure)
         self._figure_canvas.draw()
 
     def _populate_table_tab(self, result: "PipeResult") -> None:
+        # Restore the 10-column layout in case the previous run was a
+        # multi-element chain that added the Element column.
+        self._configure_table_for_single_pipe()
         tv = self._station_tree
         for item in tv.get_children():
             tv.delete(item)

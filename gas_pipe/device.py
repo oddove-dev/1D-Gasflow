@@ -62,7 +62,19 @@ class DeviceResult:
     throat : ThroatState
         Vena-contracta state from the HEM solve.
     transition : TransitionResult
-        State change through the Borda-Carnot expansion.
+        State change through the Borda-Carnot expansion. When the
+        device's HEM throat is choked (``throat.choked == True``) and
+        the chain solver enters backward-downstream-march mode (see
+        :func:`gas_pipe.chain._chain_forward_march`), this field stays
+        attached as a *Borda-Carnot prediction* of the downstream pipe
+        inlet under jet-recovery physics — but the **actual** downstream
+        pipe inlet state comes from the backward march, set by the
+        chain-end ``P_last_cell`` BC. The two values may differ; the
+        gap reflects jet-to-pipe-flow mixing that the Borda-Carnot
+        momentum balance does not model when the throat is sonic.
+        Callers should read the downstream pipe's :class:`PipeResult`
+        (with ``march_direction == "backward"``) for the operating
+        state, not :attr:`transition.state_inlet`, in that regime.
     eta_dissipation : float
         Mirror of ``transition.eta_dissipation``; surfaced at top level
         as the canonical diagnostic for downstream callers.

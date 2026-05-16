@@ -317,6 +317,8 @@ def _chain_forward_march(
     solver_options: dict,
     t0: float,
     cancel_event: object | None = None,
+    P_last_cell_target: float | None = None,
+    enable_backward_downstream: bool = False,
     **ivp_kwargs,
 ) -> ChainResult:
     """Forward chain march at fixed ``mdot``, returning a complete
@@ -327,6 +329,17 @@ def _chain_forward_march(
     brent-iterates ``P_back`` so the device's HEM throat passes the
     system ``mdot``.
 
+    When ``enable_backward_downstream`` is True and ``P_last_cell_target``
+    is provided, a Device whose HEM throat chokes triggers a second
+    pass: every Pipe element downstream of the choked Device is
+    backward-marched via :func:`march_ivp_backward` from
+    ``P_last_cell_target`` (chain BC) inward, using the chain-inlet
+    stagnation enthalpy as the conserved h_stag. The Borda-Carnot
+    transition predicted by ``_device_solve_at_mdot`` stays attached
+    to ``DeviceResult.transition`` as a diagnostic but no longer seeds
+    the downstream pipe — see CLAUDE.md "Pressure terminology" for
+    the physical justification.
+
     Raises
     ------
     OverChokedError
@@ -334,10 +347,20 @@ def _chain_forward_march(
         BVP modes wrap this in their respective sentinel/mapping logic.
     ChokeReached, IntegrationCapExceeded, SegmentConvergenceError
         Propagated from per-pipe ``march_ivp``.
+    BackwardMarchDiabaticNotSupported
+        Raised when backward downstream mode is active and a downstream
+        Pipe has any section with ``overall_U > 0`` (v1 scope).
+    BVPChoked
+        Raised when a per-pipe sanity check on the backward march
+        fails: ``P_first_cell > P_throat`` (physically inconsistent) or
+        ``M_first_cell > 0.7`` (outside v1 numerical convergence
+        envelope). The accompanying ``result`` is a partial
+        :class:`ChainResult` carrying the elements solved so far.
     """
     from .geometry import Pipe
     from .results import PipeResult
-    from .solver import march_ivp
+    from .solver import march_ivp, march_ivp_backward
+    from .errors import BackwardMarchDiabaticNotSupported
 
     results: list[Union[PipeResult, DeviceResult]] = []
     P_current = P_in
@@ -345,7 +368,29 @@ def _chain_forward_march(
     choked = False
     choke_diagnostics: dict | None = None
 
+    backward_mode_active = False
+    backward_start_index: int | None = None
+    choked_device_throat = None  # ThroatState of the choke-triggering device
+    h_stag_chain: float | None = None
+
+    # Precompute chain-inlet h_stag in case backward mode activates.
+    # Adiabatic h_stag conservation (pipe 1 → device → pipe 2) is the
+    # invariant march_ivp_backward relies on; we propagate the chain
+    # inlet's value through to every backward-marched pipe.
+    if enable_backward_downstream and P_last_cell_target is not None:
+        first_pipe = chain.pipes[0] if chain.pipes else None
+        if first_pipe is not None:
+            state_inlet = base_fluid.props(P_in, T_in)
+            A_inlet = first_pipe.sections[0].area
+            u_inlet = mdot / (state_inlet.rho * A_inlet)
+            h_stag_chain = state_inlet.h + 0.5 * u_inlet ** 2
+
     for i, element in enumerate(chain.elements):
+        if backward_mode_active:
+            # Subsequent elements are handled in the backward-march pass
+            # below; skip them in the forward pass.
+            break
+
         if isinstance(element, Pipe):
             pipe_result = march_ivp(
                 element, working_fluid, P_current, T_current, mdot,
@@ -364,7 +409,9 @@ def _chain_forward_march(
                     "x_choke": pipe_result.x_choke,
                 }
                 # A choked pipe terminates the march — downstream elements
-                # cannot be reached at this mdot.
+                # cannot be reached at this mdot. Backward march for the
+                # Fanno-bottleneck case is v2 scope (the choke happens
+                # mid-pipe with unmodeled downstream-of-choke physics).
                 break
         elif isinstance(element, Device):
             prev = results[-1] if results else None
@@ -389,14 +436,217 @@ def _chain_forward_march(
                 fluid=base_fluid, element_index=i,
             )
             results.append(device_result)
-            inlet = device_result.transition.state_inlet
-            P_current = inlet.P
-            T_current = inlet.T
+
+            if (
+                enable_backward_downstream
+                and P_last_cell_target is not None
+                and h_stag_chain is not None
+                and (
+                    device_result.throat.choked
+                    or device_result.throat.M >= 0.95
+                )
+            ):
+                # Switch to backward-downstream mode. The transition
+                # state attached to device_result remains as a diagnostic
+                # (what Borda-Carnot would have predicted); the next
+                # Pipe's actual inlet state will come from the backward
+                # march below.
+                backward_mode_active = True
+                backward_start_index = i + 1
+                choked_device_throat = device_result.throat
+                choked = True
+                choke_diagnostics = {
+                    "kind": "device_choke_downstream_backward",
+                    "element_index": i,
+                    "element_name": element.name,
+                    "max_mdot": float(device_result.throat.mdot),
+                    "P_throat": float(device_result.throat.P),
+                    "T_throat": float(device_result.throat.T),
+                }
+            else:
+                inlet = device_result.transition.state_inlet
+                P_current = inlet.P
+                T_current = inlet.T
         else:
             raise TypeError(
                 f"Unknown ChainSpec element at index {i}: "
                 f"{type(element).__name__}"
             )
+
+    # --------------------------------------------------------------
+    # Backward-downstream pass.
+    # --------------------------------------------------------------
+    if backward_mode_active:
+        assert backward_start_index is not None
+        assert choked_device_throat is not None
+        assert h_stag_chain is not None
+        assert P_last_cell_target is not None
+
+        # Collect downstream elements; v1 supports only Pipes here
+        # (multi-Device chains are deferred — see ChainSpec invariants
+        # and BACKLOG).
+        downstream = list(
+            enumerate(chain.elements)
+        )[backward_start_index:]
+        for idx, el in downstream:
+            if isinstance(el, Device):
+                raise NotImplementedError(
+                    "v1 backward downstream march does not support "
+                    "additional Devices in the choked-downstream chain; "
+                    f"element {idx} is a Device. Multi-Device chains "
+                    "are deferred to v2."
+                )
+
+        downstream_pipes = [
+            (idx, el) for idx, el in downstream if isinstance(el, Pipe)
+        ]
+        if not downstream_pipes:
+            raise RuntimeError(
+                "device throat choked but no downstream Pipe in chain "
+                "(ChainSpec validation should have caught this)."
+            )
+
+        # Adiabatic precondition: every downstream pipe section must
+        # have overall_U == 0 (h_stag invariance assumption). Surface
+        # the offending chain index in the error so the user can find
+        # it quickly.
+        for idx, pipe in downstream_pipes:
+            for sec_idx, sec in enumerate(pipe.sections):
+                if sec.overall_U != 0.0:
+                    raise BackwardMarchDiabaticNotSupported(
+                        f"Pipe at chain index {idx}, section {sec_idx} "
+                        f"has overall_U = {sec.overall_U} W/(m²·K). "
+                        "Backward downstream march requires adiabatic "
+                        "conditions in v1. Either set overall_U = 0 on "
+                        "this section, or wait for the diabatic "
+                        "extension (forward-T-backward-P iteration)."
+                    )
+
+        # Strip ivp_kwargs to the subset march_ivp_backward accepts.
+        # The backward primitive has a narrower signature than march_ivp
+        # (no adaptive flag, no Mach thresholds, no min_dx).
+        bwd_kwargs = {}
+        if "n_segments" in ivp_kwargs:
+            bwd_kwargs["n_segments"] = int(ivp_kwargs["n_segments"])
+        if "friction_model" in ivp_kwargs:
+            bwd_kwargs["friction_model"] = ivp_kwargs["friction_model"]
+
+        # Sanity check thresholds.
+        P_throat = float(choked_device_throat.P)
+        rtol_sanity = 1e-3
+
+        # Backward march from the chain end inward. Each pipe's inlet
+        # pressure becomes the next (upstream) pipe's outlet BC.
+        backward_results: list[tuple[int, "PipeResult"]] = []
+        outlet_P = float(P_last_cell_target)
+        for idx, pipe in reversed(downstream_pipes):
+            pipe_result_bwd = march_ivp_backward(
+                pipe, working_fluid,
+                P_outlet=outlet_P,
+                h_stag=h_stag_chain,
+                mdot=mdot,
+                cancel_event=cancel_event,
+                **bwd_kwargs,
+            )
+
+            P_first_cell = float(pipe_result_bwd.P[0])
+            M_first_cell = float(pipe_result_bwd.M[0])
+
+            # Sanity A: P_first_cell must not exceed P_throat — that
+            # would mean the backward march implies subsonic operation
+            # below the throat-set choke, which contradicts the choked
+            # premise. Typically signals an over-tight P_last_cell BC.
+            if P_first_cell > P_throat * (1.0 + rtol_sanity):
+                partial_results = (
+                    list(results)
+                    + [pr for _, pr in sorted(
+                        backward_results + [(idx, pipe_result_bwd)],
+                        key=lambda t: t[0],
+                    )]
+                )
+                partial = ChainResult(
+                    chain=chain,
+                    results=partial_results,
+                    mdot=mdot,
+                    P_in=P_in,
+                    P_last_cell=outlet_P,
+                    T_in=T_in,
+                    T_out=float(pipe_result_bwd.T[-1]),
+                    boundary_conditions=boundary_conditions,
+                    solver_options=solver_options,
+                    elapsed=time.time() - t0,
+                    choked=True,
+                    choke_diagnostics={
+                        **choke_diagnostics,
+                        "P_first_cell_inconsistent": P_first_cell,
+                    } if choke_diagnostics else None,
+                )
+                raise BVPChoked(
+                    "Backward march inconsistency: P_first_cell = "
+                    f"{P_first_cell / 1e5:.3f} bara exceeds P_throat = "
+                    f"{P_throat / 1e5:.3f} bara at chain index {idx}. "
+                    "This typically means the P_last_cell BC is above "
+                    "the device's choke-limited pipe-inlet pressure. "
+                    "Consider raising P_last_cell BC or reducing "
+                    "downstream pipe friction.",
+                    mdot_critical=mdot,
+                    result=partial,
+                )
+
+            # Sanity B: M_first_cell within v1 validated range. Beyond
+            # this we don't trust the non-adaptive backward Newton.
+            if M_first_cell > 0.7:
+                partial_results = (
+                    list(results)
+                    + [pr for _, pr in sorted(
+                        backward_results + [(idx, pipe_result_bwd)],
+                        key=lambda t: t[0],
+                    )]
+                )
+                partial = ChainResult(
+                    chain=chain,
+                    results=partial_results,
+                    mdot=mdot,
+                    P_in=P_in,
+                    P_last_cell=outlet_P,
+                    T_in=T_in,
+                    T_out=float(pipe_result_bwd.T[-1]),
+                    boundary_conditions=boundary_conditions,
+                    solver_options=solver_options,
+                    elapsed=time.time() - t0,
+                    choked=True,
+                    choke_diagnostics={
+                        **choke_diagnostics,
+                        "M_first_cell_out_of_envelope": M_first_cell,
+                    } if choke_diagnostics else None,
+                )
+                raise BVPChoked(
+                    f"Backward march of pipe at chain index {idx} "
+                    f"produced M_first_cell = {M_first_cell:.3f}, "
+                    "above the v1 validated convergence range "
+                    "(M < 0.7). Typically indicates the choked "
+                    "device's A_vc is too close to the downstream "
+                    "pipe's area, producing near-sonic post-"
+                    "transition flow. Reduce A_vc/A_pipe ratio or "
+                    "wait for v2 backward march with adaptive "
+                    "refinement.",
+                    mdot_critical=mdot,
+                    result=partial,
+                )
+
+            backward_results.append((idx, pipe_result_bwd))
+            # Next (upstream) pipe's outlet is this pipe's inlet.
+            outlet_P = P_first_cell
+
+        # Insert backward-marched pipes into results in chain order.
+        backward_results.sort(key=lambda t: t[0])
+        for _idx, pipe_result_bwd in backward_results:
+            results.append(pipe_result_bwd)
+
+        # Chain end state.
+        last_bwd = backward_results[-1][1]
+        P_current = float(last_bwd.P[-1])
+        T_current = float(last_bwd.T[-1])
 
     return ChainResult(
         chain=chain,
@@ -650,6 +900,13 @@ def _mode1_brentq(
     last_good: ChainResult | None = None
     last_good_mdot: float | None = None
     last_choked_mdot: float | None = None
+    # Smallest sentinel-returning mdot seen across all probes. Used as
+    # the upper bound when bisecting toward the operating-regime choke
+    # ceiling before the backward-march dispatch re-march. See the
+    # bisect block further down for why last_choke_diag.max_mdot is
+    # not sufficient: the diag's max_mdot is mdot_max at the SENTINEL
+    # probe's state_up, not at the operating regime's state_up.
+    last_choked_smallest_mdot: float | None = None
     last_choke_diag: dict | None = None
 
     def _march(mdot_try: float) -> ChainResult:
@@ -663,43 +920,53 @@ def _mode1_brentq(
             **ivp_kwargs,
         )
 
+    def _mark_choked(mdot_try: float, diag: dict | None) -> float:
+        """Bookkeeping for a sentinel-returning probe.
+
+        Updates both the latest sentinel mdot (``last_choked_mdot``) and
+        the smallest sentinel mdot ever seen (``last_choked_smallest_mdot``).
+        The smallest tracker is the upper bound for the post-walk-down
+        bisect that refines ``mdot_ceiling`` to the operating regime.
+        """
+        nonlocal last_choked_mdot, last_choked_smallest_mdot, last_choke_diag
+        last_choked_mdot = mdot_try
+        if (
+            last_choked_smallest_mdot is None
+            or mdot_try < last_choked_smallest_mdot
+        ):
+            last_choked_smallest_mdot = mdot_try
+        last_choke_diag = diag
+        return _CHOKED_SENTINEL
+
     def _obj(mdot_try: float) -> float:
-        nonlocal last_good, last_good_mdot, last_choked_mdot, last_choke_diag
+        nonlocal last_good, last_good_mdot
         try:
             r = _march(mdot_try)
             if r.choked:
-                last_choked_mdot = mdot_try
-                last_choke_diag = r.choke_diagnostics
-                return _CHOKED_SENTINEL
+                return _mark_choked(mdot_try, r.choke_diagnostics)
             last_good = r
             last_good_mdot = mdot_try
             return r.P_last_cell - P_last_cell_target
         except OverChokedError as exc:
-            last_choked_mdot = mdot_try
-            last_choke_diag = {
+            return _mark_choked(mdot_try, {
                 "kind": "device_over_choked",
                 "element_index": exc.device_index,
                 "element_name": exc.device_name,
                 "max_mdot": exc.max_mdot,
                 "P_stag": exc.P_stag,
                 "T_stag": exc.T_stag,
-            }
-            return _CHOKED_SENTINEL
+            })
         except (ChokeReached, SegmentConvergenceError):
-            last_choked_mdot = mdot_try
-            last_choke_diag = {"kind": "fanno_pipe_during_march"}
-            return _CHOKED_SENTINEL
+            return _mark_choked(mdot_try, {"kind": "fanno_pipe_during_march"})
         except (EOSOutOfRange, EOSTwoPhase, HEMConsistencyError) as exc:
             # The BC probe drove the throat-solve isentrope into a region
             # GERG cannot evaluate (near-critical, sub-dew, etc.). Treat as
             # infeasible-probe; brentq adjusts away from it.
-            last_choked_mdot = mdot_try
-            last_choke_diag = {
+            return _mark_choked(mdot_try, {
                 "kind": "eos_infeasible",
                 "exception": type(exc).__name__,
                 "message": str(exc)[:200],
-            }
-            return _CHOKED_SENTINEL
+            })
 
     # Bracket adjustment
     f_lo = _obj(mdot_lo)
@@ -798,11 +1065,65 @@ def _mode1_brentq(
                     result=last_good,
                 )
 
+            # Refine mdot_ceiling to the operating regime's choke
+            # boundary. The diag-derived estimate above is
+            # ``mdot_max`` evaluated at a SENTINEL probe's state_up,
+            # not at the state_up the chain actually presents to the
+            # device at the operating mdot. When U > 0 cools pipe 1,
+            # state_up at the device shifts across mdot probes; the
+            # captured estimate then lies well below the device's
+            # true ``mdot_max`` at operating conditions and the
+            # subsequent re-march at ``mdot_ceiling * (1 - 1e-3)``
+            # falls outside the device's just-choked tolerance window,
+            # so ``throat.choked`` stays False and the backward-march
+            # trigger does not fire.
+            #
+            # Bisect ``_obj`` between the largest feasible mdot
+            # (``last_good_mdot``) and the smallest sentinel mdot
+            # ever seen (``last_choked_smallest_mdot``) until the gap
+            # is < 1e-4 relative. The resulting ``m_hi`` is the
+            # operating-regime choke ceiling; the device at this
+            # mdot has ``throat.choked = True`` (or M very near 1)
+            # for both adiabatic and U > 0 chains.
+            # Snapshot the pre-bisect feasible probe so the subcritical
+            # fall-through bracket downstream (used when ``target`` lies
+            # above the choke-limited ``P_last_cell``) keeps the wide
+            # walk-down bracket. Without this, the bisect ratchets
+            # ``last_good_mdot`` up against the choke boundary and the
+            # subsequent brentq sees ``mdot_lo`` and ``mdot_hi`` both
+            # essentially at the ceiling — both probes return
+            # near-ceiling ``P_last_cell``, so f_lo and f_hi share the
+            # same sign and the bracket-check raises BVPNotBracketedError.
+            walkdown_last_good = last_good
+            walkdown_last_good_mdot = last_good_mdot
+            if (
+                last_choked_smallest_mdot is not None
+                and last_good_mdot is not None
+                and last_choked_smallest_mdot > last_good_mdot
+            ):
+                m_lo = last_good_mdot
+                m_hi = last_choked_smallest_mdot
+                for _ in range(20):
+                    if (m_hi - m_lo) < 1e-4 * m_hi:
+                        break
+                    m_mid = 0.5 * (m_lo + m_hi)
+                    f_mid = _obj(m_mid)
+                    if f_mid == _CHOKED_SENTINEL:
+                        m_hi = m_mid
+                    else:
+                        m_lo = m_mid
+                mdot_ceiling = m_hi
+
             # March at just-below the ceiling for the canonical
-            # choke-limited profile. mdot_ceiling * (1 - 1e-3) sits
-            # inside _device_solve_at_mdot's "just-choked" branch
-            # (rel_tol = 1e-4), so the device throat uses the choke
-            # probe directly — clean march, no inner brent.
+            # choke-limited profile. The 1e-3 cushion is loose enough
+            # to avoid hitting _device_solve_at_mdot's just-choked
+            # tolerance (rel_tol = 1e-4) inconsistently across
+            # operating regimes — e.g., adiabatic vs U > 0 yields
+            # different mdot_max curves, so a tighter cushion landed
+            # inside the just-choked window in one regime and outside
+            # in another. The downstream backward-mode trigger relies
+            # on throat.M >= 0.95 (not bitwise throat.choked), which
+            # is robust to this 0.1% offset.
             mdot_at_ceiling = mdot_ceiling * (1.0 - 1e-3)
             try:
                 r_ceiling = _march(mdot_at_ceiling)
@@ -824,29 +1145,53 @@ def _mode1_brentq(
                 )
 
             if r_ceiling.P_last_cell > P_last_cell_target * (1.0 + rtol):
-                # Even at the choke ceiling, P_last_cell exceeds the
-                # target — BC unreachable. Mirrors the analogous
-                # check in _bvp_single_pipe_mdot at the choke-limited
-                # outlet pressure.
-                r_ceiling.choked = True
-                if r_ceiling.choke_diagnostics is None:
-                    r_ceiling.choke_diagnostics = last_choke_diag
-                raise BVPChoked(
-                    f"Chain choke-limited at mdot_critical="
-                    f"{mdot_ceiling:.4f} kg/s; target P_last_cell="
-                    f"{P_last_cell_target/1e5:.3f} bara is unreachable "
-                    "(lowest achievable P_last_cell="
-                    f"{r_ceiling.P_last_cell/1e5:.3f} bara). "
-                    f"Choke diagnostic: {last_choke_diag}",
-                    mdot_critical=mdot_ceiling,
-                    result=r_ceiling,
+                # Even at the choke ceiling, forward-march P_last_cell
+                # exceeds the target. In the v0 model this was reported
+                # as BC unreachable; with the v1 backward-downstream
+                # march, the target IS reachable — the choked device
+                # decouples downstream pressure from upstream throat
+                # state, and the downstream pipe owns its inlet via
+                # backward march from the chain end. See CLAUDE.md
+                # "Pressure terminology" + the post-rename BACKLOG
+                # entry for backward-march scope.
+                #
+                # Switch to backward-downstream mode: re-march the
+                # chain at ``mdot_at_ceiling`` (the cushioned value, not
+                # the bare ``mdot_ceiling``) with backward march enabled
+                # for everything downstream of the choked device. After
+                # the bisect refinement above, ``mdot_ceiling = m_hi``
+                # is a SENTINEL-returning mdot — passing it directly
+                # would raise ``OverChokedError`` at the device because
+                # it sits just above ``mdot_max`` at the operating
+                # state_up. The 1e-3 cushion lands inside the device's
+                # sub-choke regime with ``throat.M`` close enough to 1
+                # for the ``M >= 0.95`` backward-mode trigger to fire.
+                # The returned ChainResult has choked=True and
+                # choke_diagnostics.kind == "device_choke_downstream_backward";
+                # it is NOT a BVPChoked exception because the BC is
+                # genuinely satisfied at the chain end.
+                return _chain_forward_march(
+                    chain, working_fluid, base_fluid,
+                    P_in, T_in, mdot_at_ceiling,
+                    boundary_conditions=boundary_conditions,
+                    solver_options=solver_options,
+                    t0=t0,
+                    cancel_event=cancel_event,
+                    P_last_cell_target=P_last_cell_target,
+                    enable_backward_downstream=True,
+                    **ivp_kwargs,
                 )
 
-            # Target IS reachable in (last_good_mdot, mdot_at_ceiling).
-            # Tighten the bracket and fall through to the main brentq.
-            mdot_lo = last_good_mdot
+            # Target IS reachable in (walkdown_last_good_mdot,
+            # mdot_at_ceiling) via subcritical forward march. Tighten
+            # the bracket and fall through to the main brentq. Use the
+            # pre-bisect feasible probe as the lower endpoint — the
+            # bisect refined ``last_good_mdot`` toward the ceiling,
+            # which would collapse the bracket to two near-ceiling
+            # probes with the same-sign objective.
+            mdot_lo = walkdown_last_good_mdot
             mdot_hi = mdot_at_ceiling
-            f_lo = last_good.P_last_cell - P_last_cell_target
+            f_lo = walkdown_last_good.P_last_cell - P_last_cell_target
             f_hi = r_ceiling.P_last_cell - P_last_cell_target
 
         else:
