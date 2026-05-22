@@ -1357,7 +1357,7 @@ def solve_for_mdot(
             fluid,
             T_in=T_in,
             P_in=P_in,
-            P_last_cell=P_out,
+            P_out=P_out,
             **kwargs,
         )
     except BVPChoked as exc:

@@ -288,6 +288,12 @@ _SKARV_BC = {
     "P_in_bara": 50.0,
     "T_in_C": 100.0,
     "P_last_cell_bara": 2.0,
+    # P_out is the reservoir pressure the chain discharges into (the live
+    # downstream BC from Item 10). Default to atmospheric for the Skarv
+    # flare tip. ``P_last_cell_bara`` is kept present but unused during
+    # the Item 10 commit-1 scaffolding; the BC panel rewire lands in
+    # commit 2.
+    "P_out_bara": 1.013,
     "mdot_kgs": "",  # blank → Mode 1 dispatched
 }
 
@@ -491,6 +497,10 @@ class MainWindow:
         self.var_P_last_cell = tk.StringVar(
             value=str(_SKARV_BC["P_last_cell_bara"]),
         )
+        # Item 10 scaffolding: reservoir / outlet pressure (P_out) — the
+        # live downstream BC. BC panel rewire lands in commit 2; for now
+        # the variable exists but is not yet bound into the panel.
+        self.var_P_out = tk.StringVar(value=str(_SKARV_BC["P_out_bara"]))
         self.var_mdot = tk.StringVar(value=str(_SKARV_BC["mdot_kgs"]))
         # Solver
         # Discretization: split into adaptive + (linear N or dimensionless α).

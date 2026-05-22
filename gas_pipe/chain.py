@@ -126,9 +126,13 @@ class ChainResult:
     not yet reachable, the latter is future work).
 
     ``P_last_cell`` is the pressure in the last cell of the last pipe — a
-    computed quantity. The legacy name ``P_out`` is exposed as a
-    deprecation alias; it is reserved for the future chain-level
-    post-expansion BC and should not be used in new code.
+    computed quantity, never an input. ``P_out`` is the reservoir
+    pressure the chain discharges into (the downstream BC). When the
+    outlet is subsonic ``P_last_cell == P_out`` within solver tolerance;
+    when the outlet is sonic (``outlet_sonic``) ``P_last_cell > P_out``
+    and the difference is taken up by an under-expanded free jet outside
+    the pipe (modelled in a later layer). See CLAUDE.md "Pressure
+    terminology".
     """
 
     chain: ChainSpec
@@ -143,6 +147,8 @@ class ChainResult:
     elapsed: float = 0.0
     choked: bool = False
     choke_diagnostics: dict | None = None
+    outlet_sonic: bool = False
+    P_out: float | None = None
 
     @property
     def pipe_results(self) -> list["PipeResult"]:
@@ -153,24 +159,6 @@ class ChainResult:
     @property
     def device_results(self) -> list[DeviceResult]:
         return [r for r in self.results if isinstance(r, DeviceResult)]
-
-    @property
-    def P_out(self) -> float:
-        """Deprecated alias for :attr:`P_last_cell`.
-
-        ``P_out`` is reserved for the future chain-level downstream BC
-        (post free-jet expansion). Until that BC and the corresponding
-        outlet-expansion model land, this alias returns ``P_last_cell``
-        unchanged so legacy callers keep working — but new code should
-        read ``P_last_cell`` directly.
-        """
-        warnings.warn(
-            "ChainResult.P_out is deprecated; use P_last_cell instead. "
-            "P_out is reserved for the future chain-level post-expansion BC.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.P_last_cell
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +665,7 @@ def solve_chain(
     T_in: float,
     *,
     P_in: float | None = None,
+    P_out: float | None = None,
     P_last_cell: float | None = None,
     mdot: float | None = None,
     mdot_bracket: tuple[float, float] | None = None,
@@ -691,16 +680,46 @@ def solve_chain(
     T_range_override: tuple[float, float] | None = None,
     **ivp_kwargs,
 ) -> ChainResult:
-    """Three-mode chain BVP solver. See module docstring for overview."""
+    """Three-mode chain BVP solver. See module docstring for overview.
+
+    The downstream BC is ``P_out`` — the reservoir pressure the chain
+    discharges into. The deprecated ``P_last_cell`` kwarg is accepted for
+    one transitional release and mapped to ``P_out`` with a
+    :class:`DeprecationWarning`; ``P_last_cell`` is always a computed
+    result, never a true input.
+    """
+    # Downstream-BC normalization. ``P_out`` is canonical; ``P_last_cell``
+    # is a deprecated alias for one transitional release. Internally the
+    # solver still binds the downstream pressure to the ``P_last_cell``
+    # local (the forward-march criterion swap lands in commit 2).
+    if P_last_cell is not None:
+        if P_out is not None:
+            raise ValueError(
+                "solve_chain: pass either P_out (reservoir pressure) or the "
+                "deprecated P_last_cell, not both."
+            )
+        warnings.warn(
+            "P_last_cell as a BC is deprecated; pass P_out (reservoir "
+            "pressure) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        P_out = P_last_cell
+    # Bind the internal downstream-BC name. Commit 1 keeps the existing
+    # _mode1_brentq / _mode3_brentq machinery, which is written against
+    # ``P_last_cell``; commit 2 replaces that with the forward-march
+    # criterion driven directly by ``P_out``.
+    P_last_cell = P_out
+
     given = [
         name for name, val in (
-            ("P_in", P_in), ("P_last_cell", P_last_cell), ("mdot", mdot),
+            ("P_in", P_in), ("P_out", P_out), ("mdot", mdot),
         )
         if val is not None
     ]
     if len(given) != 2:
         raise ValueError(
-            "solve_chain requires exactly two of (P_in, P_last_cell, mdot); "
+            "solve_chain requires exactly two of (P_in, P_out, mdot); "
             f"got {given}"
         )
 
@@ -712,7 +731,7 @@ def solve_chain(
     # preserved exactly (bracket heuristics, _find_critical_mdot, etc.).
     if (
         "P_in" in given
-        and "P_last_cell" in given
+        and "P_out" in given
         and len(chain.elements) == 1
     ):
         from .solver import _bvp_single_pipe_mdot
@@ -821,10 +840,10 @@ def solve_chain(
             **ivp_kwargs,
         )
 
-    if "P_in" in given and "P_last_cell" in given:
-        return _mode1_brentq(
+    if "P_in" in given and "P_out" in given:
+        return _mode1_forward_pout(
             chain, working_fluid, base_fluid,
-            P_in, T_in, P_last_cell,
+            P_in, T_in, P_out,
             mdot_bracket=mdot_bracket,
             rtol=rtol,
             progress_callback=progress_callback,
@@ -844,6 +863,101 @@ def solve_chain(
         progress_callback=progress_callback,
         cancel_event=cancel_event,
         boundary_conditions=bcs,
+        solver_options=solver_options,
+        t0=t0,
+        **ivp_kwargs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Single forward-march criterion for the (P_in, P_out) BC pair
+# ---------------------------------------------------------------------------
+
+
+def _march_chain_outlet_pressure(
+    chain: ChainSpec,
+    working_fluid: "FluidEOSBase",
+    base_fluid: "GERGFluid",
+    P_in: float,
+    T_in: float,
+    mdot: float,
+    *,
+    boundary_conditions: dict,
+    solver_options: dict,
+    t0: float,
+    cancel_event: object | None = None,
+    **ivp_kwargs,
+) -> tuple[ChainResult, bool]:
+    """Forward-march the chain at fixed ``mdot``; report outlet sonic state.
+
+    Returns ``(result, outlet_is_sonic)`` where ``outlet_is_sonic`` is
+    True iff the last pipe's outlet cell has reached M = 1. This is the
+    primitive the single forward-march criterion (commit 2) calls to
+    decide whether the chain is in the subsonic-outlet regime
+    (``P_last_cell == P_out``) or the sonic-outlet regime
+    (``P_last_cell > P_out``, under-expanded jet downstream).
+
+    Commit 1 (scaffolding): a thin wrapper over
+    :func:`_chain_forward_march` that reports the existing per-pipe
+    ``choked`` flag as the outlet-sonic proxy. Commit 2 refines this to
+    check the LAST pipe's outlet-cell Mach specifically (a mid-pipe
+    Fanno choke is a different state).
+    """
+    result = _chain_forward_march(
+        chain, working_fluid, base_fluid,
+        P_in, T_in, mdot,
+        boundary_conditions=boundary_conditions,
+        solver_options=solver_options,
+        t0=t0,
+        cancel_event=cancel_event,
+        **ivp_kwargs,
+    )
+    return result, bool(result.choked)
+
+
+def _mode1_forward_pout(
+    chain: ChainSpec,
+    working_fluid: "FluidEOSBase",
+    base_fluid: "GERGFluid",
+    P_in: float,
+    T_in: float,
+    P_out_target: float,
+    *,
+    mdot_bracket: tuple[float, float] | None,
+    rtol: float,
+    progress_callback: Callable[[str, float], None] | None,
+    cancel_event: object | None,
+    boundary_conditions: dict,
+    solver_options: dict,
+    t0: float,
+    **ivp_kwargs,
+) -> ChainResult:
+    """Single forward-march criterion for a fixed (P_in, P_out) pair.
+
+    With P_in and the reservoir pressure P_out both fixed there is
+    exactly one mdot. The selection criterion changes character
+    continuously at the choke threshold:
+
+    - subsonic outlet: find mdot such that ``P_last_cell(mdot) = P_out``;
+    - sonic outlet: the outlet is pinned at M = 1 and ``P_last_cell``
+      rises above ``P_out`` (under-expanded jet takes up the rest); the
+      selected mdot is the choke-limited one.
+
+    Commit 1 (scaffolding): delegates to the existing
+    :func:`_mode1_brentq` so behaviour is byte-identical. The real
+    forward-march criterion (root-find on outlet pressure + choke-
+    threshold bisection via :func:`_march_chain_outlet_pressure`)
+    lands in commit 2, along with removal of the backward-march
+    machinery in :func:`_chain_forward_march`.
+    """
+    return _mode1_brentq(
+        chain, working_fluid, base_fluid,
+        P_in, T_in, P_out_target,
+        mdot_bracket=mdot_bracket,
+        rtol=rtol,
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+        boundary_conditions=boundary_conditions,
         solver_options=solver_options,
         t0=t0,
         **ivp_kwargs,
