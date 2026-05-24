@@ -45,12 +45,21 @@ class TransitionResult:
         Dissipation efficiency ``1 - (u_inlet/u_vc)²``. Bounds: → 1 for
         sharp expansion (``A_vc ≪ A_down``, typical PSV); → 0 for marginal
         expansion (``A_vc ≈ A_down``).
+    f_rec : float
+        Compressible recovery-taper factor ``∈ [0, 1]`` applied to the
+        vena-contracta momentum-flux term (see
+        :func:`_borda_carnot_transition`). ``→ 1`` in the incompressible
+        limit (``M_vc → 0``, full Borda-Carnot recovery) and ``→ 0`` at a
+        sonic vena contracta (``M_vc → 1``, no subsonic recovery). With the
+        taper active, both ``f_rec`` and the realized recovery ``dP`` vanish
+        at choke.
     """
 
     state_inlet: "FluidState"
     u_inlet: float
     dP: float
     eta_dissipation: float
+    f_rec: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -296,11 +305,52 @@ def _borda_carnot_transition(
 
     - Energy: ``R_h = h(P_in, T_in) + u_in²/2 - h_stag`` with
       ``h_stag = throat.h + throat.u²/2``.
-    - Momentum: ``R_p = P_in - P_t - ρ_t·u_t²·(A_vc/A_down) + ρ_in·u_in²``.
+    - Momentum: ``R_p = P_in - P_t - f_rec·ρ_t·u_t²·(A_vc/A_down) + ρ_in·u_in²``.
 
     Initial guess uses the constant-density approximation. Convergence
     is on the L2 norm of residuals scaled by ``(P_stag, u_throat²)``;
     tolerance 1e-8, cap 20 iterations.
+
+    Compressible recovery taper ``f_rec(M_vc)``
+    --------------------------------------------
+    The momentum-flux term ``ρ_t·u_t²·(A_vc/A_down)`` is the kinetic flux
+    leaving the vena contracta that, in the incompressible Borda-Carnot
+    picture, is recovered as a static-pressure rise downstream. That
+    recovery scales with the vena-contracta velocity — which is SONIC at
+    choke — so a naive (untapered) balance predicts its LARGEST recovery
+    exactly where it is least physical: a choked / under-expanded sonic jet
+    does not recover static pressure by subsonic sudden-expansion mixing.
+    We therefore scale the term by an engineering taper
+
+        f_rec = 1 - M_vc²    (M_vc = throat Mach = throat.M)
+
+    clamped to ``[0, 1]``, with
+
+      - ``f_rec → 1`` as ``M_vc → 0``  (incompressible limit — the original
+        Borda-Carnot balance, where it is validated, is recovered exactly);
+      - ``f_rec → 0`` as ``M_vc → 1``  (sonic vena contracta — recovery
+        collapses, so ``P_in → P_t`` and the inlet pressure approaches the
+        choke pressure ``P_crit``).
+
+    IMPORTANT — this is a modeling choice, not a derived closed form. The
+    quadratic shape is chosen because (a) it is smooth with the correct two
+    limits and (b) it mirrors the velocity-squared (kinetic-energy) scaling
+    of the recovery term itself. It is the minimal taper that makes the
+    chain choked↔subcritical transition continuous (no ~7 bara jump in the
+    downstream pipe inlet at the regime boundary, where ``M_vc → 1``). A
+    future reader should not mistake ``1 - M_vc²`` for exact theory; if a
+    better-validated compressible sudden-expansion correlation appears,
+    swap it in here.
+
+    Effect on diagnostics: with the taper the realized recovery collapses
+    at choke — ``dP = (mdot/A_down)·(f_rec·u_t - u_in)`` goes to a small
+    NEGATIVE value as ``f_rec → 0``, i.e. ``P_in → P_t⁻ → P_crit``. The
+    ``eta_dissipation`` field is a *geometric* kinetic-energy dissipation
+    ratio ``1 - (u_in/u_t)²``; it is set by the area ratio ``A_vc/A_down``
+    and is essentially unaffected by the taper (it stays ≈ 1 for a sharp
+    expansion regardless of ``M_vc``). So ``dP`` and ``eta_dissipation`` are
+    distinct diagnostics — only ``dP`` (and ``f_rec``) track the recovery
+    collapse at choke.
 
     Raises
     ------
@@ -324,7 +374,16 @@ def _borda_carnot_transition(
     mdot = throat.mdot
 
     h_stag = state_t.h + 0.5 * u_t * u_t
-    momentum_constant = P_t + rho_t * u_t * u_t * (A_vc / A_down)
+
+    # Compressible recovery taper f_rec(M_vc) — see docstring. Scales the
+    # vena-contracta momentum-flux term so the recovery collapses to zero at
+    # a sonic vena contracta. throat.M is u_t / c_HEM (already populated by
+    # the HEM throat solve); clamp defensively in case of FD/EOS noise that
+    # nudges M just past 1.0.
+    M_vc = throat.M
+    f_rec = 1.0 - M_vc * M_vc
+    f_rec = max(0.0, min(1.0, f_rec))
+    momentum_constant = P_t + f_rec * rho_t * u_t * u_t * (A_vc / A_down)
 
     # Constant-density initial guess
     u_in_guess = u_t * A_vc / A_down  # mass conservation with ρ unchanged
@@ -423,4 +482,5 @@ def _borda_carnot_transition(
         u_inlet=u_in,
         dP=dP,
         eta_dissipation=eta,
+        f_rec=f_rec,
     )
