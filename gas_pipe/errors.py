@@ -127,3 +127,51 @@ class OverChokedError(GasPipeError):
         self.attempted_mdot = attempted_mdot
         self.P_stag = P_stag
         self.T_stag = T_stag
+
+
+class DeviceMustGoSubcritical(GasPipeError):
+    """Internal control-flow signal from the backward-downstream pass.
+
+    Raised when the backward march from the reservoir ``P_out`` produces
+    a downstream-pipe inlet pressure (``P_first_cell``) that EXCEEDS the
+    device throat pressure (``P_throat``). This is NOT an inconsistency
+    to report to the user: a choked device cannot have a back-pressure
+    above its own choke pressure, so the trial ``mdot`` is too high — the
+    device must operate SUBCRITICAL at a lower ``mdot``. ``_mode1_brentq``
+    catches this and re-dispatches to a subcritical forward solve (find
+    ``mdot`` below the choke ceiling such that the forward march lands the
+    last cell at ``P_out``, with the device subcritical and Borda-Carnot
+    recovery valid).
+
+    At the regime boundary ``P_first_cell == P_throat`` both descriptions
+    coincide (Borda-Carnot recovery at the choke pressure is zero net),
+    so the transition is continuous.
+
+    Parameters
+    ----------
+    pipe_index : int
+        Chain index of the backward-marched pipe whose inlet tripped.
+    mdot_attempted : float
+        Trial ``mdot`` at which the backward march ran [kg/s]. Becomes the
+        upper bound of the subcritical forward solve.
+    P_first_cell : float
+        Backward-marched downstream-pipe inlet pressure [Pa].
+    P_throat : float
+        Device throat (choke) pressure [Pa]. ``P_first_cell > P_throat``
+        is the trip condition.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        pipe_index: int,
+        mdot_attempted: float,
+        P_first_cell: float,
+        P_throat: float,
+    ) -> None:
+        super().__init__(message)
+        self.pipe_index = pipe_index
+        self.mdot_attempted = mdot_attempted
+        self.P_first_cell = P_first_cell
+        self.P_throat = P_throat

@@ -31,6 +31,7 @@ from .errors import (
     BVPChoked,
     BVPNotBracketedError,
     ChokeReached,
+    DeviceMustGoSubcritical,
     EOSOutOfRange,
     EOSTwoPhase,
     HEMConsistencyError,
@@ -540,45 +541,27 @@ def _chain_forward_march(
             P_first_cell = float(pipe_result_bwd.P[0])
             M_first_cell = float(pipe_result_bwd.M[0])
 
-            # Sanity A: P_first_cell must not exceed P_throat — that
-            # would mean the backward march implies subsonic operation
-            # below the throat-set choke, which contradicts the choked
-            # premise. Typically signals an over-tight P_last_cell BC.
+            # Regime transition (NOT an error): P_first_cell exceeding
+            # P_throat means the backward march implies a downstream-pipe
+            # inlet pressure ABOVE the device's choke pressure. A choked
+            # device cannot sustain a back-pressure above its own choke
+            # pressure, so the trial mdot is too high — the device must go
+            # SUBCRITICAL at a lower mdot. Signal _mode1_brentq to switch
+            # to the subcritical forward solve (where Borda-Carnot
+            # recovery is valid). At the boundary P_first_cell == P_throat
+            # the two descriptions coincide, so the transition is
+            # continuous.
             if P_first_cell > P_throat * (1.0 + rtol_sanity):
-                partial_results = (
-                    list(results)
-                    + [pr for _, pr in sorted(
-                        backward_results + [(idx, pipe_result_bwd)],
-                        key=lambda t: t[0],
-                    )]
-                )
-                partial = ChainResult(
-                    chain=chain,
-                    results=partial_results,
-                    mdot=mdot,
-                    P_in=P_in,
-                    P_last_cell=outlet_P,
-                    T_in=T_in,
-                    T_out=float(pipe_result_bwd.T[-1]),
-                    boundary_conditions=boundary_conditions,
-                    solver_options=solver_options,
-                    elapsed=time.time() - t0,
-                    choked=True,
-                    choke_diagnostics={
-                        **choke_diagnostics,
-                        "P_first_cell_inconsistent": P_first_cell,
-                    } if choke_diagnostics else None,
-                )
-                raise BVPChoked(
-                    "Backward march inconsistency: P_first_cell = "
-                    f"{P_first_cell / 1e5:.3f} bara exceeds P_throat = "
-                    f"{P_throat / 1e5:.3f} bara at chain index {idx}. "
-                    "This typically means the P_last_cell BC is above "
-                    "the device's choke-limited pipe-inlet pressure. "
-                    "Consider raising P_last_cell BC or reducing "
-                    "downstream pipe friction.",
-                    mdot_critical=mdot,
-                    result=partial,
+                raise DeviceMustGoSubcritical(
+                    "Backward march at chain index "
+                    f"{idx} implies pipe-inlet P = "
+                    f"{P_first_cell / 1e5:.3f} bara above device throat P = "
+                    f"{P_throat / 1e5:.3f} bara at mdot = {mdot:.4f} kg/s; "
+                    "device cannot be choked here — go subcritical.",
+                    pipe_index=idx,
+                    mdot_attempted=mdot,
+                    P_first_cell=P_first_cell,
+                    P_throat=P_throat,
                 )
 
             # Sanity B: M_first_cell within v1 validated range. Beyond
@@ -726,9 +709,9 @@ def solve_chain(
     t0 = time.time()
     bcs = {"given": tuple(given), "T_in": T_in}
 
-    # Single-pipe Mode 1 fast path: delegate to the legacy
-    # _bvp_single_pipe_mdot so existing solve_for_mdot test behavior is
-    # preserved exactly (bracket heuristics, _find_critical_mdot, etc.).
+    # Single-pipe (P_in, P_out) fast path: delegate to the legacy
+    # _bvp_single_pipe_mdot, which finds mdot for a target outlet
+    # pressure. In the new contract that target IS the reservoir P_out.
     if (
         "P_in" in given
         and "P_out" in given
@@ -738,7 +721,9 @@ def solve_chain(
 
         pipe = chain.elements[0]
 
-        def _wrap_pipe_result_in_chain(pr: "PipeResult") -> ChainResult:
+        def _wrap_pipe_result_in_chain(
+            pr: "PipeResult", outlet_sonic: bool,
+        ) -> ChainResult:
             return ChainResult(
                 chain=chain,
                 results=[pr],
@@ -750,12 +735,15 @@ def solve_chain(
                 boundary_conditions=bcs,
                 solver_options=dict(pr.solver_options or {}),
                 elapsed=time.time() - t0,
-                choked=bool(pr.choked),
+                choked=bool(outlet_sonic),
                 choke_diagnostics=(
-                    {"kind": "fanno_pipe", "element_index": 0,
-                     "x_choke": pr.x_choke}
-                    if pr.choked else None
+                    {"kind": "outlet_sonic", "element_index": 0,
+                     "x_choke": pr.x_choke,
+                     "P_last_cell": float(pr.P[-1]), "P_out": P_out}
+                    if outlet_sonic else None
                 ),
+                outlet_sonic=outlet_sonic,
+                P_out=P_out,
             )
 
         try:
@@ -773,16 +761,14 @@ def solve_chain(
                 **ivp_kwargs,
             )
         except BVPChoked as exc:
-            # Uniform exception contract: solve_chain's BVPChoked.result
-            # is always a ChainResult. _bvp_single_pipe_mdot raises with
-            # a PipeResult payload, so wrap before re-raising.
-            wrapped = _wrap_pipe_result_in_chain(exc.result)
-            raise BVPChoked(
-                str(exc),
-                mdot_critical=exc.mdot_critical,
-                result=wrapped,
-            ) from exc
-        return _wrap_pipe_result_in_chain(pipe_result)
+            # A single adiabatic pipe discharging to a reservoir below its
+            # choke-limited last-cell pressure is OUTLET-SONIC, not an
+            # error: the exit reaches M = 1, P_last_cell is the choke
+            # pressure (> P_out), and the difference is an under-expanded
+            # jet downstream (Lag 2). Return a clean ChainResult rather
+            # than re-raising.
+            return _wrap_pipe_result_in_chain(exc.result, outlet_sonic=True)
+        return _wrap_pipe_result_in_chain(pipe_result, outlet_sonic=False)
 
     # ------------------------------------------------------------------
     # Multi-element or non-Mode-1 path.
@@ -854,10 +840,13 @@ def solve_chain(
             **ivp_kwargs,
         )
 
-    # Mode 3 — (P_last_cell, mdot) given.
-    return _mode3_brentq(
+    # Mode 3 — (P_out, mdot) given → solve for P_in. The reservoir BC is
+    # P_out; _mode3_brentq matches it as the last-cell target. Stamp P_out
+    # and outlet_sonic onto the converged result for reporting parity
+    # with the Mode 1 path.
+    mode3_result = _mode3_brentq(
         chain, working_fluid, base_fluid,
-        T_in, P_last_cell, mdot,
+        T_in, P_out, mdot,
         P_in_bracket=P_in_bracket,
         rtol=rtol,
         progress_callback=progress_callback,
@@ -867,6 +856,11 @@ def solve_chain(
         t0=t0,
         **ivp_kwargs,
     )
+    mode3_result.P_out = P_out
+    mode3_result.outlet_sonic = _outlet_sonic_flag(
+        mode3_result.P_last_cell, P_out, rtol,
+    )
+    return mode3_result
 
 
 # ---------------------------------------------------------------------------
@@ -962,6 +956,295 @@ def _mode1_forward_pout(
         t0=t0,
         **ivp_kwargs,
     )
+
+
+def _last_pipe_outlet_sonic(
+    result: ChainResult, chain: ChainSpec, mach_choke: float,
+) -> bool:
+    """True iff the chain's LAST pipe reached M >= mach_choke at its exit.
+
+    Mach-based internal detector (used to spot a forward-march outlet
+    choke). The RESULT's ``outlet_sonic`` *field* is set from the
+    pressure criterion (:func:`_outlet_sonic_flag`) — the physical
+    meaning of outlet-sonic is "P_last_cell exceeds P_out (a jet absorbs
+    the difference)", not "outlet Mach is high".
+    """
+    from .results import PipeResult
+
+    if len(result.results) == len(chain.elements) and result.results:
+        last = result.results[-1]
+        if isinstance(last, PipeResult) and len(last.M) > 0:
+            return float(last.M[-1]) >= mach_choke
+    return False
+
+
+def _outlet_sonic_flag(P_last_cell: float, P_out: float, rtol: float) -> bool:
+    """Outlet-sonic iff the computed last cell strictly exceeds P_out.
+
+    When ``P_last_cell == P_out`` (within rtol) the gas discharges to the
+    reservoir at reservoir pressure — no under-expanded jet, so NOT
+    outlet-sonic even if the pinned outlet cell sits near M = 1. The flag
+    means specifically that ``P_last_cell > P_out`` and the difference is
+    taken up by a free jet downstream (Lag 2).
+    """
+    return P_last_cell > P_out * (1.0 + rtol)
+
+
+def _mode1_pipe_bottleneck(
+    chain: ChainSpec,
+    working_fluid: "FluidEOSBase",
+    base_fluid: "GERGFluid",
+    P_in: float,
+    T_in: float,
+    P_out_target: float,
+    *,
+    mdot_device: float,
+    mdot_lo: float,
+    rtol: float,
+    cancel_event: object | None,
+    boundary_conditions: dict,
+    solver_options: dict,
+    t0: float,
+    device_throat_P: float | None = None,
+    **ivp_kwargs,
+) -> ChainResult:
+    """REGIME II - downstream pipe is the bottleneck (mdot_pipe < mdot_device).
+
+    Entered when the choked-device backward march at the device ceiling
+    signals :class:`DeviceMustGoSubcritical` (P_first_cell > P_throat) or
+    fails on an EOS / convergence edge: the downstream pipe cannot
+    discharge the device-choke-limited mdot to ``P_out`` subsonically, so
+    the PIPE binds and the device runs SUBCRITICAL.
+
+    ``mdot_pipe`` is the BACKWARD DISCHARGE CAPACITY: the largest mdot at
+    which the downstream pipe can discharge to ``P_out`` with its OUTLET
+    still subsonic (``march_ivp_backward`` converges). Above it the outlet
+    would go supersonic at ``P_out`` and the backward march fails; that
+    failure boundary is the capacity. (The downstream pipe does NOT
+    forward-Fanno-choke from its Borda-Carnot inlet here - fed from the
+    ~recovery pressure it dies out at M ~ 0.1 at its exit - so the capacity
+    is set at the reservoir outlet, not at a forward exit choke.)
+
+    The device-side and pipe-side inlet pressures must agree at the
+    interface; ``F(mdot) = device_BC_inlet(mdot) - backward_inlet(mdot)``
+    is monotone DECREASING (device recovery falls with mdot, pipe inlet
+    rises with mdot). The selected mdot is whichever binds first as mdot
+    rises from ``mdot_lo``: the consistency crossing ``F = 0`` (if the
+    backward march stays valid up to it) or the backward-discharge
+    capacity (if the outlet goes sonic first). Either way the downstream
+    pipe is anchored at ``P_out`` by the backward march, so
+    ``P_last_cell == P_out`` and ``mdot`` DECREASES as the pipe narrows.
+    Borda-Carnot recovery stays a diagnostic only (it is non-physical when
+    the device discharges into a far-lower reservoir).
+    """
+    from .solver import march_ivp, march_ivp_backward
+    from .errors import BackwardMarchDiabaticNotSupported
+
+    rtol_local = max(rtol, 1e-5)
+
+    device_idx = next(
+        (i for i, el in enumerate(chain.elements) if isinstance(el, Device)),
+        None,
+    )
+    if device_idx is None:
+        raise BVPNotBracketedError(
+            "Pipe-bottleneck solve requires a device in the chain."
+        )
+    upstream_elements = chain.elements[:device_idx]
+    device = chain.elements[device_idx]
+    downstream_pipes = [
+        (i, el) for i, el in enumerate(chain.elements) if i > device_idx
+    ]
+    for i, el in downstream_pipes:
+        if isinstance(el, Device):
+            raise NotImplementedError(
+                "v1 pipe-bottleneck solve does not support a second Device "
+                f"downstream (element {i})."
+            )
+    if not downstream_pipes:
+        raise BVPNotBracketedError(
+            "Pipe-bottleneck solve: no downstream pipe after the device."
+        )
+    for i, pipe in downstream_pipes:
+        for sec_idx, sec in enumerate(pipe.sections):
+            if sec.overall_U != 0.0:
+                raise BackwardMarchDiabaticNotSupported(
+                    f"Pipe at chain index {i}, section {sec_idx} has "
+                    f"overall_U = {sec.overall_U}. The pipe-bottleneck "
+                    "solve backward-marches the downstream pipe and "
+                    "requires adiabatic conditions in v1."
+                )
+
+    bwd_kwargs: dict = {}
+    if "n_segments" in ivp_kwargs:
+        bwd_kwargs["n_segments"] = int(ivp_kwargs["n_segments"])
+    if "friction_model" in ivp_kwargs:
+        bwd_kwargs["friction_model"] = ivp_kwargs["friction_model"]
+
+    A_down = downstream_pipes[0][1].sections[0].area
+
+    def _forward_to_device(mdot: float):
+        results: list = []
+        P_cur, T_cur, u_cur = P_in, T_in, 0.0
+        for el in upstream_elements:
+            pr = march_ivp(
+                el, working_fluid, P_cur, T_cur, mdot,
+                cancel_event=cancel_event, **ivp_kwargs,
+            )
+            results.append(pr)
+            P_cur = float(pr.P[-1])
+            T_cur = float(pr.T[-1])
+            u_cur = float(pr.u[-1])
+        state_up = base_fluid.props(P_cur, T_cur)
+        device_result = _device_solve_at_mdot(
+            device, state_up, u_cur, mdot, A_down,
+            fluid=base_fluid, element_index=device_idx,
+        )
+        dev_inlet_P = float(device_result.transition.state_inlet.P)
+        h_stag_device = state_up.h + 0.5 * u_cur ** 2
+        return results, device_result, dev_inlet_P, h_stag_device
+
+    def _backward(mdot: float, h_stag: float):
+        bwd: list = []
+        outlet_P = float(P_out_target)
+        for i, pipe in reversed(downstream_pipes):
+            prb = march_ivp_backward(
+                pipe, working_fluid,
+                P_outlet=outlet_P, h_stag=h_stag, mdot=mdot,
+                cancel_event=cancel_event, **bwd_kwargs,
+            )
+            bwd.append((i, prb))
+            outlet_P = float(prb.P[0])
+        bwd.sort(key=lambda t: t[0])
+        last_pipe = bwd[-1][1]
+        M_out = float(last_pipe.M[-1]) if len(last_pipe.M) > 0 else float("inf")
+        return [pr for _, pr in bwd], float(bwd[0][1].P[0]), M_out
+
+    # The backward-discharge capacity is the largest mdot whose backward
+    # march keeps the chain OUTLET subsonic (M_out <= 1).
+    #
+    # ITEM 10 FINDING #1: ``march_ivp_backward`` does NOT reject a
+    # supersonic outlet — it integrates straight past M = 1 and returns
+    # M_out > 1 rather than raising. So feasibility MUST be decided on
+    # ``M_out <= 1``, NOT on whether the march raised an exception.
+    # M_out rises monotonically with mdot (and as the pipe narrows),
+    # which is what makes the discharge capacity — and the diameter
+    # sweep — cleanly monotone.
+    def _outlet_mach(mdot: float) -> tuple[float, dict | None]:
+        try:
+            fwd, dev_res, dev_inlet, h_stag = _forward_to_device(mdot)
+        except (
+            OverChokedError, ChokeReached, SegmentConvergenceError,
+            EOSOutOfRange, EOSTwoPhase, HEMConsistencyError,
+        ):
+            # Device cannot pass mdot (>= ceiling) — treat as super-capacity.
+            return float("inf"), None
+        try:
+            bwd, bwd_inlet, M_out = _backward(mdot, h_stag)
+        except (
+            SegmentConvergenceError, EOSOutOfRange, EOSTwoPhase,
+            HEMConsistencyError,
+        ):
+            # Backward march hit an EOS / convergence edge: the outlet is
+            # past the feasible (subsonic) range — treat as super-capacity.
+            return float("inf"), None
+        return M_out, {
+            "fwd": fwd, "dev_res": dev_res, "dev_inlet": dev_inlet,
+            "bwd": bwd, "bwd_inlet": bwd_inlet,
+        }
+
+    def _assemble(mdot: float, pl: dict) -> ChainResult:
+        results = list(pl["fwd"]) + [pl["dev_res"]] + list(pl["bwd"])
+        last_bwd = pl["bwd"][-1]
+        P_last_cell = float(last_bwd.P[-1])  # == P_out (outlet pinned)
+        outlet_sonic = _outlet_sonic_flag(P_last_cell, P_out_target, rtol_local)
+        diag: dict = {
+            "kind": "pipe_discharge_limited",
+            "device_subcritical": True,
+            "mdot_pipe": mdot,
+            "mdot_device": mdot_device,
+            "P_last_cell": P_last_cell,
+            "P_out": P_out_target,
+            "pipe_inlet": pl["bwd_inlet"],
+            "device_BC_inlet": pl["dev_inlet"],
+        }
+        if device_throat_P:
+            diag["device_throat_P"] = device_throat_P
+            if abs(mdot - mdot_device) <= 2e-2 * mdot_device:
+                # Regime boundary D*: device ~ at choke, pipe ~ at P_out.
+                diag["regime_boundary"] = True
+                diag["consistency_pipe_inlet_over_throat"] = (
+                    pl["bwd_inlet"] / device_throat_P
+                )
+        return ChainResult(
+            chain=chain, results=results, mdot=mdot,
+            P_in=P_in, P_last_cell=P_last_cell,
+            T_in=T_in, T_out=float(last_bwd.T[-1]),
+            boundary_conditions=boundary_conditions,
+            solver_options=solver_options,
+            elapsed=time.time() - t0,
+            choked=True,
+            choke_diagnostics=diag,
+            outlet_sonic=outlet_sonic,
+            P_out=P_out_target,
+        )
+
+    # Upper bound: the device ceiling. mdot_pipe = min(device, pipe), so it
+    # never exceeds the ceiling. At the ceiling the outlet is supersonic
+    # (Regime II); if it is subsonic the device binds (degenerate).
+    M_hi, pl_hi = _outlet_mach(mdot_device)
+    if M_hi <= 1.0 and pl_hi is not None:
+        return _assemble(mdot_device, pl_hi)
+
+    # Anchor the subsonic side by walking DOWN from the device ceiling.
+    #
+    # ITEM 10 FINDING #2: anchor by walking DOWN from mdot_device, NOT by
+    # halving up from a low seed. M_out is monotone INCREASING in mdot, so
+    # the first subsonic probe walking down is just below the discharge
+    # capacity. Crucially, ``_device_solve_at_mdot``'s P_back brentq stops
+    # bracketing at FAR-SUBCRITICAL (too-LOW) mdot and raises
+    # OverChokedError there — a low-side bracketing failure, NOT a real
+    # over-choke. Halving up from a low seed walks straight into that
+    # zone and breaks (the 20 mm case). Walking down reaches the subsonic
+    # band before that low-mdot edge.
+    m_super = mdot_device
+    m_sub: float | None = None
+    pl_sub: dict | None = None
+    m = mdot_device
+    floor = max(mdot_lo * 1e-3, 1e-9)
+    for _ in range(60):
+        m *= 0.9
+        if m < floor:
+            break
+        M_m, pl_m = _outlet_mach(m)
+        if pl_m is not None and M_m <= 1.0:
+            m_sub, pl_sub = m, pl_m
+            break
+        if math.isfinite(M_m) and M_m > 1.0:
+            m_super = m  # tighten the supersonic bound
+    if m_sub is None or pl_sub is None:
+        raise BVPNotBracketedError(
+            "Pipe-bottleneck solve: no subsonic-outlet probe found walking "
+            f"down from {mdot_device:.4f} kg/s for "
+            f"P_out={P_out_target/1e5:.3f} bara."
+        )
+
+    # Bisect the subsonic <-> supersonic outlet boundary -> mdot_pipe.
+    m_lo2, pl_lo2 = m_sub, pl_sub
+    m_hi2 = m_super
+    for _ in range(80):
+        if (m_hi2 - m_lo2) < rtol_local * m_hi2:
+            break
+        m_mid = 0.5 * (m_lo2 + m_hi2)
+        M_mid, pl_mid = _outlet_mach(m_mid)
+        if pl_mid is not None and M_mid <= 1.0:
+            m_lo2, pl_lo2 = m_mid, pl_mid
+        else:
+            m_hi2 = m_mid
+
+    # m_lo2 is the discharge capacity (outlet just subsonic at P_out); the
+    # downstream pipe is anchored at P_out, device subcritical.
+    return _assemble(m_lo2, pl_lo2)
 
 
 # ---------------------------------------------------------------------------
@@ -1284,17 +1567,67 @@ def _mode1_brentq(
                 # choke_diagnostics.kind == "device_choke_downstream_backward";
                 # it is NOT a BVPChoked exception because the BC is
                 # genuinely satisfied at the chain end.
-                return _chain_forward_march(
-                    chain, working_fluid, base_fluid,
-                    P_in, T_in, mdot_at_ceiling,
-                    boundary_conditions=boundary_conditions,
-                    solver_options=solver_options,
-                    t0=t0,
-                    cancel_event=cancel_event,
-                    P_last_cell_target=P_last_cell_target,
-                    enable_backward_downstream=True,
-                    **ivp_kwargs,
+                #
+                # Regime transition: if the backward march signals
+                # DeviceMustGoSubcritical (P_first_cell > P_throat) — or
+                # fails on an EOS / convergence edge at the choke ceiling
+                # (the downstream pipe cannot pass the device-choke mdot)
+                # — the device cannot actually be choked here. Fall to the
+                # subcritical forward solve at a LOWER mdot, where the
+                # Borda-Carnot recovery is valid. Diabatic-downstream is a
+                # genuine v1 limitation and is NOT caught (it still
+                # raises BackwardMarchDiabaticNotSupported).
+                _mach_choke = float(ivp_kwargs.get("mach_choke", 0.99))
+                # Device throat pressure at the ceiling (for the
+                # subcritical/choked boundary consistency check).
+                P_throat_at_ceiling: float | None = None
+                for _el in r_ceiling.results:
+                    if isinstance(_el, DeviceResult):
+                        try:
+                            P_throat_at_ceiling = float(_el.throat.P)
+                        except (AttributeError, TypeError, ValueError):
+                            P_throat_at_ceiling = None
+                        break
+                try:
+                    backward_result = _chain_forward_march(
+                        chain, working_fluid, base_fluid,
+                        P_in, T_in, mdot_at_ceiling,
+                        boundary_conditions=boundary_conditions,
+                        solver_options=solver_options,
+                        t0=t0,
+                        cancel_event=cancel_event,
+                        P_last_cell_target=P_last_cell_target,
+                        enable_backward_downstream=True,
+                        **ivp_kwargs,
+                    )
+                except (
+                    DeviceMustGoSubcritical, SegmentConvergenceError,
+                    EOSOutOfRange, EOSTwoPhase, HEMConsistencyError,
+                ):
+                    return _mode1_pipe_bottleneck(
+                        chain, working_fluid, base_fluid,
+                        P_in, T_in, P_last_cell_target,
+                        mdot_device=mdot_at_ceiling,
+                        mdot_lo=walkdown_last_good_mdot,
+                        rtol=rtol,
+                        cancel_event=cancel_event,
+                        boundary_conditions=boundary_conditions,
+                        solver_options=solver_options,
+                        t0=t0,
+                        device_throat_P=float(P_throat_at_ceiling)
+                        if P_throat_at_ceiling is not None else None,
+                        **ivp_kwargs,
+                    )
+                # Consistent choked regime — stamp the reservoir BC and
+                # the outlet state onto the backward result. Outlet-sonic
+                # is pressure-based: True only if the chain end sits above
+                # P_out (here the backward march pins it AT P_out, so the
+                # flag is False — the gas discharges at reservoir pressure).
+                backward_result.P_out = P_last_cell_target
+                backward_result.outlet_sonic = _outlet_sonic_flag(
+                    backward_result.P_last_cell, P_last_cell_target, rtol,
                 )
+                return backward_result
 
             # Target IS reachable in (walkdown_last_good_mdot,
             # mdot_at_ceiling) via subcritical forward march. Tighten
@@ -1366,6 +1699,16 @@ def _mode1_brentq(
             mdot_critical=mdot_sol,
             result=final,
         )
+    # Subsonic-outlet solution (P_last_cell == P_out). Stamp the
+    # reservoir BC + outlet state. outlet_sonic is pressure-based (True
+    # only if P_last_cell strictly exceeds P_out). The device may be
+    # subcritical (kind="subcritical") or choked-but-BC-satisfied.
+    final.P_out = P_last_cell_target
+    final.outlet_sonic = _outlet_sonic_flag(
+        final.P_last_cell, P_last_cell_target, rtol,
+    )
+    if not final.choked and final.choke_diagnostics is None:
+        final.choke_diagnostics = {"kind": "subcritical"}
     return final
 
 

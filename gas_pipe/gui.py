@@ -278,23 +278,17 @@ _SKARV_GEOMETRY = {
 }
 
 _SKARV_BC = {
-    # 3-field BC layout: user fills exactly two of (P_in, P_last_cell,
-    # mdot), leaves the third blank. The Skarv default targets BVP
-    # Mode 1 (P_in + P_last_cell → mdot), so P_in and P_last_cell are
-    # filled and mdot is blank. The empty mdot field preserves the prior
-    # solve-for-mdot default behavior. ``P_last_cell`` is the per-pipe
-    # last-cell pressure — not a chain-level post-expansion BC; see the
-    # "Pressure terminology" section of CLAUDE.md.
+    # 3-field BC layout: user fills exactly two of (P_in, P_out, mdot),
+    # leaves the third blank. The Skarv default fills P_in and the
+    # reservoir P_out (atmospheric flare tip) and leaves mdot blank, so
+    # the solver finds mdot from the (P_in, P_out) forward/backward
+    # criterion. ``P_out`` is the reservoir pressure the chain discharges
+    # into — the live downstream BC; the last-cell pressure is a computed
+    # result. See the "Pressure terminology" section of CLAUDE.md.
     "P_in_bara": 50.0,
     "T_in_C": 100.0,
-    "P_last_cell_bara": 2.0,
-    # P_out is the reservoir pressure the chain discharges into (the live
-    # downstream BC from Item 10). Default to atmospheric for the Skarv
-    # flare tip. ``P_last_cell_bara`` is kept present but unused during
-    # the Item 10 commit-1 scaffolding; the BC panel rewire lands in
-    # commit 2.
     "P_out_bara": 1.013,
-    "mdot_kgs": "",  # blank → Mode 1 dispatched
+    "mdot_kgs": "",  # blank → (P_in, P_out) → mdot
 }
 
 _SKARV_SOLVER = {
@@ -486,20 +480,15 @@ class MainWindow:
             }],
         }]
         self.var_T_amb = tk.StringVar(value=str(_SKARV_GEOMETRY["ambient_T_C"]))
-        # BC — three input fields (P_in, P_last_cell, mdot); user fills
-        # exactly two and leaves the third blank. ``P_last_cell`` is the
-        # per-pipe last-cell pressure (not chain-level post-expansion;
-        # see CLAUDE.md "Pressure terminology"). Submit-time validation
-        # in _gather_inputs enforces the "exactly two" rule and dispatches
-        # the corresponding solve_chain mode.
+        # BC — three input fields (P_in, P_out, mdot); user fills exactly
+        # two and leaves the third blank. ``P_out`` is the reservoir
+        # pressure the chain discharges into (the live downstream BC); the
+        # last-cell pressure is a computed result (see CLAUDE.md "Pressure
+        # terminology"). Submit-time validation in _gather_inputs enforces
+        # the "exactly two" rule and dispatches the corresponding
+        # solve_chain mode.
         self.var_P_in = tk.StringVar(value=str(_SKARV_BC["P_in_bara"]))
         self.var_T_in = tk.StringVar(value=str(_SKARV_BC["T_in_C"]))
-        self.var_P_last_cell = tk.StringVar(
-            value=str(_SKARV_BC["P_last_cell_bara"]),
-        )
-        # Item 10 scaffolding: reservoir / outlet pressure (P_out) — the
-        # live downstream BC. BC panel rewire lands in commit 2; for now
-        # the variable exists but is not yet bound into the panel.
         self.var_P_out = tk.StringVar(value=str(_SKARV_BC["P_out_bara"]))
         self.var_mdot = tk.StringVar(value=str(_SKARV_BC["mdot_kgs"]))
         # Solver
@@ -1274,15 +1263,15 @@ class MainWindow:
         v = self._validate_cmd
         _add_labeled_entry(f, 0, "Inlet P [bara]", self.var_P_in, v)
         _add_labeled_entry(f, 1, "Inlet T [°C]", self.var_T_in, v)
-        e_pipe_end = _add_labeled_entry(
-            f, 2, "Pipe end P [bara]", self.var_P_last_cell, v,
+        e_pout = _add_labeled_entry(
+            f, 2, "Reservoir / outlet P (P_out) [bara]", self.var_P_out, v,
         )
         _make_tooltip(
-            e_pipe_end,
-            "Pressure in the last cell of the last pipe. NOT the "
-            "atmospheric / downstream-of-expansion pressure — the "
-            "post-expansion BC is reserved for a future outlet-expansion "
-            "model and is not yet coupled to the solver.",
+            e_pout,
+            "Reservoir pressure the chain discharges into (atmosphere / "
+            "flare tip / LP header). The last-cell pressure is computed; "
+            "when the outlet chokes it sits ABOVE this reservoir pressure "
+            "and the difference becomes an under-expanded jet.",
         )
         _add_labeled_entry(f, 3, "Mass flow [kg/s]", self.var_mdot, v)
 
@@ -1290,7 +1279,7 @@ class MainWindow:
         hint = ttk.Label(
             f,
             text=(
-                "Fill exactly two of (Inlet P, Pipe end P, Mass flow). "
+                "Fill exactly two of (Inlet P, Reservoir P, Mass flow). "
                 "Leave the third blank to solve for it."
             ),
             wraplength=380, foreground="#555555", justify="left",
@@ -1934,18 +1923,18 @@ class MainWindow:
             )
 
         P_in_str = self.var_P_in.get().strip()
-        P_last_cell_str = self.var_P_last_cell.get().strip()
+        P_out_str = self.var_P_out.get().strip()
         mdot_str = self.var_mdot.get().strip()
         filled = [
             name for name, val in (
                 ("Inlet P", P_in_str),
-                ("Pipe end P", P_last_cell_str),
+                ("Reservoir P", P_out_str),
                 ("Mass flow", mdot_str),
             ) if val
         ]
         if len(filled) != 2:
             raise _InputValidationError(
-                "Exactly two of (Inlet P, Pipe end P, Mass flow) must be "
+                "Exactly two of (Inlet P, Reservoir P, Mass flow) must be "
                 f"specified. Got: {filled or 'none'}."
             )
 
@@ -1953,32 +1942,32 @@ class MainWindow:
             _parse_positive_float(P_in_str, "Inlet P") * 1e5
             if P_in_str else None
         )
-        P_last_cell = (
-            _parse_positive_float(P_last_cell_str, "Pipe end P") * 1e5
-            if P_last_cell_str else None
+        P_out = (
+            _parse_positive_float(P_out_str, "Reservoir P") * 1e5
+            if P_out_str else None
         )
         mdot = (
             _parse_positive_float(mdot_str, "Mass flow")
             if mdot_str else None
         )
 
-        # Sanity: if both P_in and P_last_cell are given, Inlet P must be
-        # the higher one (forward flow direction). Other pairings cannot
-        # be cross-validated here without running the solver.
+        # Sanity: if both P_in and P_out are given, Inlet P must be the
+        # higher one (forward flow direction). Other pairings cannot be
+        # cross-validated here without running the solver.
         if (
             P_in is not None
-            and P_last_cell is not None
-            and P_last_cell >= P_in
+            and P_out is not None
+            and P_out >= P_in
         ):
             raise _InputValidationError(
-                f"Pipe end P ({P_last_cell / 1e5:.2f} bara) must be lower "
+                f"Reservoir P ({P_out / 1e5:.2f} bara) must be lower "
                 f"than Inlet P ({P_in / 1e5:.2f} bara)."
             )
 
         bc = {
             "P_in": P_in,
             "T_in": T_in_K,
-            "P_last_cell": P_last_cell,
+            "P_out": P_out,
             "mdot": mdot,
         }
 
@@ -2153,14 +2142,14 @@ class MainWindow:
         eos_kwargs = inputs["eos_kwargs"]
         discretization = inputs["discretization"]
 
-        # The 3-field BC layout populates exactly two of (P_in,
-        # P_last_cell, mdot); the omitted field is None. Pass through to
-        # solve_chain which dispatches the mode from the keyword
-        # combination.
+        # The 3-field BC layout populates exactly two of (P_in, P_out,
+        # mdot); the omitted field is None. Pass through to solve_chain
+        # which dispatches from the keyword combination. P_out is the
+        # reservoir (downstream) BC.
         chain_kwargs = {
             k: v for k, v in (
                 ("P_in", bc["P_in"]),
-                ("P_last_cell", bc["P_last_cell"]),
+                ("P_out", bc["P_out"]),
                 ("mdot", bc["mdot"]),
             ) if v is not None
         }
@@ -2227,12 +2216,12 @@ class MainWindow:
             return
 
         bc = inputs["bc"]
-        if bc["P_in"] is None or bc["P_last_cell"] is None:
+        if bc["P_in"] is None or bc["P_out"] is None:
             messagebox.showinfo(
                 "Verify table accuracy",
                 "Table-accuracy verification compares two BVP solves "
                 "(table interpolation vs direct EOS). Fill in both "
-                "Inlet P and Pipe end P, leave Mass flow blank, and try "
+                "Inlet P and Reservoir P, leave Mass flow blank, and try "
                 "again.",
                 parent=self.root,
             )
@@ -2265,7 +2254,7 @@ class MainWindow:
 
         def _do_verify() -> dict:
             return verify_eos_accuracy(
-                pipe, fluid, bc["P_in"], bc["T_in"], bc["P_last_cell"],
+                pipe, fluid, bc["P_in"], bc["T_in"], bc["P_out"],
                 cancel_event=self._worker.cancel_event,
                 **table_kwargs, **solver_kwargs,
             )
@@ -2591,8 +2580,8 @@ class MainWindow:
         if inputs["bc"]["P_in"] is None:
             messagebox.showinfo(
                 "Plateau sweep",
-                "Plateau sweep sweeps Pipe end P from a given Inlet P. "
-                "Fill in Inlet P (and Mass flow or Pipe end P) and try "
+                "Plateau sweep sweeps reservoir P_out from a given Inlet "
+                "P. Fill in Inlet P (and Mass flow or Reservoir P) and try "
                 "again.",
                 parent=self.root,
             )
@@ -2793,6 +2782,16 @@ class MainWindow:
         n_devices = len(result.device_results)
         dP_total = (result.P_in - result.P_last_cell) / 1e5  # bara
 
+        last_cell_line = (
+            f"  Last cell P  = {result.P_last_cell / 1e5:.3f} bara  "
+            "(computed)"
+        )
+        if result.outlet_sonic:
+            last_cell_line += (
+                " — outlet sonic; under-expanded jet downstream "
+                "(P_last_cell > P_out)"
+            )
+
         header_lines = [
             "=" * 78,
             f"CHAIN ANALYSIS — {n_pipes} pipe(s), {n_devices} device(s)",
@@ -2800,8 +2799,13 @@ class MainWindow:
             f"  Boundary conditions given: {', '.join(given) if given else '(?)'}",
             f"  ṁ            = {result.mdot:.4f} kg/s",
             f"  Inlet P      = {result.P_in / 1e5:.3f} bara  (chain BC)",
-            f"  Last cell P  = {result.P_last_cell / 1e5:.3f} bara  "
-            "(last pipe, chain result)",
+        ]
+        if result.P_out is not None:
+            header_lines.append(
+                f"  Reservoir P_out = {result.P_out / 1e5:.3f} bara  (chain BC)"
+            )
+        header_lines += [
+            last_cell_line,
             f"  ΔP_total     = {dP_total:.3f} bara",
             f"  T_in         = {result.T_in - 273.15:.2f} °C",
             f"  T_out        = {result.T_out - 273.15:.2f} °C",
@@ -3023,7 +3027,7 @@ class MainWindow:
             f"({(exc.attempted_mdot / exc.max_mdot - 1.0) * 100:+.1f}%)\n"
             "\n"
             "Try one of:\n"
-            "  • Lower the requested mass flow (Mode 1: drop P_in or raise P_last_cell)\n"
+            "  • Lower the requested mass flow (drop P_in or raise P_out)\n"
             "  • Raise upstream pressure P_in (Mode 2)\n"
             "  • Enlarge device A_geom (or raise Cd if appropriate)\n"
         )
