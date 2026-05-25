@@ -308,6 +308,7 @@ def _chain_forward_march(
     cancel_event: object | None = None,
     P_last_cell_target: float | None = None,
     enable_backward_downstream: bool = False,
+    two_phase_diagnostics: bool = True,
     **ivp_kwargs,
 ) -> ChainResult:
     """Forward chain march at fixed ``mdot``, returning a complete
@@ -384,6 +385,7 @@ def _chain_forward_march(
             pipe_result = march_ivp(
                 element, working_fluid, P_current, T_current, mdot,
                 cancel_event=cancel_event,
+                two_phase_diagnostics=two_phase_diagnostics,
                 **ivp_kwargs,
             )
             results.append(pipe_result)
@@ -535,6 +537,7 @@ def _chain_forward_march(
                 h_stag=h_stag_chain,
                 mdot=mdot,
                 cancel_event=cancel_event,
+                two_phase_diagnostics=two_phase_diagnostics,
                 **bwd_kwargs,
             )
 
@@ -1110,20 +1113,25 @@ def _mode1_pipe_bottleneck(
     _last_pipe = downstream_pipes[-1][1]
     A_exit = _last_pipe.section_at(_last_pipe.length)[0].area
 
-    def _march_upstream(mdot: float):
+    def _march_upstream(mdot: float, diagnostics: bool = False):
         """March the upstream pipe(s) at ``mdot``.
 
         Returns ``(fwd_results, state_up, u_up, h_stag)`` for the device
         inlet. ``h_stag`` is exact across the device, so it is also the
         conserved invariant for the adiabatic downstream backward march
         (correct even when the upstream pipe is diabatic).
+
+        ``diagnostics`` gates the per-cell two-phase work in the march
+        result: False on throwaway scan/bisection probes, True only on the
+        re-march of the accepted operating point (see the Item 10 perf fix).
         """
         results: list = []
         P_cur, T_cur, u_cur = P_in, T_in, 0.0
         for el in upstream_elements:
             pr = march_ivp(
                 el, working_fluid, P_cur, T_cur, mdot,
-                cancel_event=cancel_event, **ivp_kwargs,
+                cancel_event=cancel_event,
+                two_phase_diagnostics=diagnostics, **ivp_kwargs,
             )
             results.append(pr)
             P_cur = float(pr.P[-1])
@@ -1132,13 +1140,15 @@ def _mode1_pipe_bottleneck(
         state_up = base_fluid.props(P_cur, T_cur)
         return results, state_up, u_cur, state_up.h + 0.5 * u_cur ** 2
 
-    def _forward_to_device(mdot: float):
+    def _forward_to_device(mdot: float, diagnostics: bool = False):
         """March upstream pipe(s) + solve the device at ``mdot``.
 
         Returns ``(fwd_results, device_result, devBC, h_stag)`` where
         ``devBC`` is the tapered Borda-Carnot pipe-inlet pressure.
         """
-        results, state_up, u_cur, h_stag_device = _march_upstream(mdot)
+        results, state_up, u_cur, h_stag_device = _march_upstream(
+            mdot, diagnostics=diagnostics,
+        )
         device_result = _device_solve_at_mdot(
             device, state_up, u_cur, mdot, A_down,
             fluid=base_fluid, element_index=device_idx,
@@ -1147,8 +1157,27 @@ def _mode1_pipe_bottleneck(
         return results, device_result, devBC, h_stag_device
 
     def _exit_mach(P: float, mdot: float, h_stag: float) -> float:
-        """Local Mach at the chain-exit area for outlet pressure ``P``."""
-        st = state_from_P_hstag(working_fluid, P, h_stag, mdot, A_exit)
+        """Local Mach at the chain-exit area for outlet pressure ``P``.
+
+        A ``state_from_P_hstag`` failure here is itself a MEANINGFUL signal,
+        not a numerical error: it means the gas cannot reach pressure ``P``
+        single-phase (expanding to ``P`` drops it below the EOS/dew boundary
+        — a deeply subcooled, non-physical state). Physically that ``P`` lies
+        BELOW the single-phase sonic pressure, so the exit there would be
+        SUPERSONIC — return ``+inf`` (M > 1). This routes ``_P_exit_sonic`` to
+        bracket the sonic state at higher pressure where the state IS single-
+        phase, instead of propagating a NaN that the F-scan would mistake for
+        a gap (the old 15 mm / P_out=1.013 wrong-root bug: the short-circuit
+        probe at the low P_out hit this two-phase point and crashed the whole
+        sonic solve). The OPERATING exit is single-phase; only this
+        hypothetical low-P probe is two-phase. (BACKLOG: the free jet OUTSIDE
+        the pipe, expanding P_exit_sonic → P_out, is where two-phase actually
+        lives — the Lag-2 jet model's concern, not the pipe solution.)
+        """
+        try:
+            st = state_from_P_hstag(working_fluid, P, h_stag, mdot, A_exit)
+        except (SegmentConvergenceError, EOSOutOfRange, EOSTwoPhase):
+            return float("inf")
         u = mdot / (st.rho * A_exit)
         return u / st.a
 
@@ -1180,12 +1209,14 @@ def _mode1_pipe_bottleneck(
                 P_hi = P_mid
         return 0.5 * (P_lo + P_hi)
 
-    def _backward_from_anchor(mdot: float, h_stag: float):
+    def _backward_from_anchor(mdot: float, h_stag: float,
+                              diagnostics: bool = False):
         """Backward-march downstream pipe(s) from ``max(P_out, P_exit_sonic)``.
 
         Returns ``(bwd_results, P_first, P_anchor, P_exit_sonic)``. A tiny
         upward nudge on the anchor is retried if the first backward segment
-        Newton struggles right at the ``M = 1`` knife-edge.
+        Newton struggles right at the ``M = 1`` knife-edge. ``diagnostics``
+        gates the per-cell two-phase work (False on throwaway probes).
         """
         P_sonic = _P_exit_sonic(mdot, h_stag)
         P_anchor = max(P_out_target, P_sonic)
@@ -1197,7 +1228,8 @@ def _mode1_pipe_bottleneck(
                     prb = march_ivp_backward(
                         pipe, working_fluid,
                         P_outlet=outlet_P, h_stag=h_stag, mdot=mdot,
-                        cancel_event=cancel_event, **bwd_kwargs,
+                        cancel_event=cancel_event,
+                        two_phase_diagnostics=diagnostics, **bwd_kwargs,
                     )
                     bwd.append((i, prb))
                     outlet_P = float(prb.P[0])
@@ -1282,9 +1314,15 @@ def _mode1_pipe_bottleneck(
     # itself proof the device cannot be choked here, so fall through to the
     # subcritical solve.
     try:
-        fwd_c, dev_c, devBC_c, h_stag_c = _forward_to_device(mdot_device)
+        # diagnostics=True: this single trial IS the accepted solution when
+        # the device is choked, so its marches must carry full two-phase
+        # diagnostics (only one forward + one backward, so cheap even when it
+        # falls through to the subcritical solve below).
+        fwd_c, dev_c, devBC_c, h_stag_c = _forward_to_device(
+            mdot_device, diagnostics=True,
+        )
         bwd_c, P_first_c, P_anchor_c, P_sonic_c = _backward_from_anchor(
-            mdot_device, h_stag_c,
+            mdot_device, h_stag_c, diagnostics=True,
         )
         if P_first_c <= P_crit * (1.0 + rtol_local):
             # Consistent: a choked device CAN sit behind this pipe inlet.
@@ -1303,40 +1341,58 @@ def _mode1_pipe_bottleneck(
     # unchokes — devBC rises (recovery returns as M_vc < 1, f_rec > 0) and
     # P_first falls (the pipe carries less flow), so F rises through zero.
     # That crossing is the subcritical operating point.
-    def _eval(mdot: float):
-        fwd, dev, devBC, h_stag = _forward_to_device(mdot)
-        bwd, P_first, P_anchor, P_sonic = _backward_from_anchor(mdot, h_stag)
+    def _F(mdot: float):
+        """``F(mdot) = devBC − P_first`` with each infeasible / failed probe
+        mapped to a sentinel that the bracketing logic interprets correctly:
+
+          ``+inf`` — physical LOW side. The device ``P_back`` brent fails to
+            bracket at FAR-subcritical (too-low) mdot (``OverChokedError`` with
+            ``attempted_mdot < max_mdot``). Below the operating band → skip.
+
+          ``-inf`` — physical HIGH side. The device is over its choke ceiling
+            (``OverChokedError`` with ``attempted_mdot >= max_mdot``). This —
+            and ONLY this — closes the bracket from above. It is the
+            crossing-pinned-to-the-ceiling case (Item 10 20 mm): the thin
+            ``F < 0`` sliver lives right at the ceiling where the device
+            over-chokes.
+
+          ``NaN`` — NUMERICAL gap at an otherwise-valid mdot: a device-stage
+            HEM/Newton/EOS failure, or a backward-march Newton/EOS failure
+            (e.g. a per-P_out table-grid artifact near the sonic anchor). This
+            is NOT a physical boundary, so it must be SKIPPED — never used to
+            close a bracket. Signing such a failure ``-inf`` would fabricate a
+            spurious crossing far below the true one and break the
+            P_out-independence of the (exit-sonic) solution, since which mdot
+            trips the artifact depends on the per-P_out table window.
+
+        Forward (device) and backward (pipe) stages are caught separately so a
+        backward-march numerical failure is never mistaken for the device's
+        physical over-choke high side.
+        """
+        try:
+            fwd, dev, devBC, h_stag = _forward_to_device(mdot)
+        except OverChokedError as exc:
+            if exc.attempted_mdot >= exc.max_mdot * (1.0 - 1e-4):
+                return float("-inf"), None  # over the ceiling — high side
+            return float("inf"), None       # P_back-brent fail — low side
+        except (
+            HEMConsistencyError, ChokeReached, SegmentConvergenceError,
+            EOSOutOfRange, EOSTwoPhase,
+        ):
+            return float("nan"), None        # device-stage numerical gap
+        try:
+            bwd, P_first, P_anchor, P_sonic = _backward_from_anchor(mdot, h_stag)
+        except (SegmentConvergenceError, EOSOutOfRange, EOSTwoPhase):
+            return float("nan"), None        # backward-march numerical gap
         payload = (fwd, dev, devBC, bwd, P_first, P_anchor, P_sonic)
         return devBC - P_first, payload
 
-    def _F(mdot: float):
-        """``F(mdot)`` with infeasible probes mapped to a signed sentinel.
-
-        Two distinct infeasibilities bound the subcritical band, on
-        OPPOSITE sides, so they must be signed differently for bracketing:
-
-          - ``OverChokedError`` — the device ``P_back`` brent fails to
-            bracket at FAR-subcritical (too-LOW) mdot → ``+inf`` (the
-            ``F > 0`` / low side).
-          - Borda-Carnot / pipe-transition divergence (the pipe inlet would
-            be supersonic at too-HIGH mdot) → ``-inf`` (the ``F < 0`` /
-            high side).
-        """
-        try:
-            return _eval(mdot)
-        except OverChokedError:
-            return float("inf"), None
-        except (
-            ChokeReached, SegmentConvergenceError,
-            EOSOutOfRange, EOSTwoPhase, HEMConsistencyError,
-        ):
-            return float("-inf"), None
-
     # Bracket the F = 0 crossing by scanning mdot ascending from mdot_lo to
-    # mdot_device. Infeasible probes are skipped; the first feasible
-    # F > 0 → F < 0 transition between consecutive feasible probes is the
-    # bracket. (F is monotone decreasing in mdot on the feasible band, so
-    # there is at most one crossing.)
+    # mdot_device. F is monotone decreasing in mdot on the feasible band, so
+    # there is at most one crossing. The bracket closes on the first feasible
+    # F > 0 followed by an ``F < 0`` point — a feasible negative F, OR a
+    # high-side ``-inf`` over-choke probe (crossing pinned to the ceiling).
+    # ``+inf`` (too-low) and ``NaN`` (numerical gap) probes are skipped.
     n_scan = 32
     prev_m: float | None = None
     prev_F: float | None = None
@@ -1345,12 +1401,13 @@ def _mode1_pipe_bottleneck(
     for k in range(n_scan + 1):
         m = mdot_lo + (mdot_device - mdot_lo) * k / n_scan
         F_m, pl_m = _F(m)
-        if not math.isfinite(F_m):
-            continue
+        if F_m == float("inf") or math.isnan(F_m):
+            continue  # too-low side, or numerical gap — no bracketing info
         if prev_F is not None and prev_F > 0.0 and F_m < 0.0:
             lo_m, lo_pl, hi_m = prev_m, prev_pl, m
             break
-        prev_m, prev_F, prev_pl = m, F_m, pl_m
+        if math.isfinite(F_m):
+            prev_m, prev_F, prev_pl = m, F_m, pl_m
 
     if lo_m is None:
         # No feasible F > 0 → F < 0 transition found. Per the standing
@@ -1362,18 +1419,40 @@ def _mode1_pipe_bottleneck(
             f"{P_out_target/1e5:.3f} bara)."
         )
 
-    # Bisect [lo_m (F>0), hi_m (F<0)] for F = 0; keep the latest F > 0
-    # (subcritical, feasible) probe as the returned operating point.
+    # Bisect [lo_m (F>0), hi_m (F<0)] for F = 0; keep the latest feasible
+    # F > 0 (subcritical) probe as the returned operating point. The hard
+    # iteration cap is a guaranteed-termination backstop: true bisection to
+    # rtol_local ~ 1e-5 needs <25 iterations, so 100 is ample, and it bounds
+    # the worst case if a stubborn numerical-gap region keeps tripping the
+    # NaN branch (the 18 mm / P_out=1.013 near-infinite loop).
     m_best, pl_best = lo_m, lo_pl
-    while (hi_m - lo_m) >= rtol_local * hi_m:
+    for _ in range(100):
+        if (hi_m - lo_m) < rtol_local * hi_m:
+            break
         m_mid = 0.5 * (lo_m + hi_m)
         F_mid, pl_mid = _F(m_mid)
+        if math.isnan(F_mid):
+            # Numerical gap at the midpoint — re-probe at points strictly
+            # INSIDE the current bracket (offsets scaled to the span). A fixed
+            # relative offset (the old ±0.1–0.3 %) lands OUTSIDE [lo_m, hi_m]
+            # once the bracket is narrower than the offset, and assigning that
+            # to lo_m/hi_m makes the bracket grow — which is exactly why the
+            # bisection failed to converge on 18 mm / P_out=1.013. Span-scaled
+            # interior probes can never escape the bracket.
+            span = hi_m - lo_m
+            for frac in (0.25, 0.75, 0.4, 0.6):
+                m_try = lo_m + frac * span
+                F_try, pl_try = _F(m_try)
+                if not math.isnan(F_try):
+                    m_mid, F_mid, pl_mid = m_try, F_try, pl_try
+                    break
+        if math.isnan(F_mid):
+            hi_m = m_mid          # whole neighbourhood is a gap — narrow down
+            continue
         if not math.isfinite(F_mid):
-            # Infeasible probe: +inf → too low (raise floor); -inf → too
-            # high (lower ceiling).
-            if F_mid > 0.0:
+            if F_mid > 0.0:       # +inf → too low (raise floor)
                 lo_m = m_mid
-            else:
+            else:                 # -inf → over ceiling (lower the top)
                 hi_m = m_mid
             continue
         if F_mid > 0.0:
@@ -1381,7 +1460,47 @@ def _mode1_pipe_bottleneck(
         else:
             hi_m = m_mid
 
-    fwd_s, dev_s, devBC_s, bwd_s, P_first_s, P_anchor_s, P_sonic_s = pl_best
+    # Part 2 guard — a root-finder must NEVER return a non-root. The
+    # bracketing can converge to the feasible EDGE of a NaN/sentinel gap with
+    # the true F = 0 buried inside it (the old 15 mm / P_out=1.013 wrong root:
+    # m_best ≈ 0.4397 with F ≈ +5 bar, not 0). ``F`` at the returned point must
+    # be ≈ 0; if it is not, the crossing was not resolved (a gap the scan
+    # could not push through), so report infeasibility with numbers rather
+    # than silently returning a gap edge as the operating point. Part 1
+    # removes the specific gap that triggered this, so for well-posed
+    # geometries this never fires — it is the geometry/fluid/window-agnostic
+    # guarantee of the P_out-independence property.
+    F_best = pl_best[2] - pl_best[4]              # devBC − P_first at m_best
+    tol_F = max(5.0e3, 1.0e-3 * abs(pl_best[2]))  # ~few mbar floor + 0.1% rel
+    if abs(F_best) > tol_F:
+        raise BVPNotBracketedError(
+            "Pipe-bottleneck subcritical solve: bracketing converged to a "
+            f"NON-ROOT (gap edge) at mdot = {m_best:.4f} kg/s — F = devBC − "
+            f"P_first = {F_best/1e5:.3f} bar (devBC = {pl_best[2]/1e5:.3f}, "
+            f"P_first = {pl_best[4]/1e5:.3f} bara), not ≈ 0. The true F = 0 "
+            "crossing lies inside an unresolved NaN/sentinel gap. P_crit = "
+            f"{P_crit/1e5:.3f}, P_out = {P_out_target/1e5:.3f} bara."
+        )
+
+    # Re-march the accepted operating point with FULL two-phase diagnostics
+    # (the scan/bisection marches ran with diagnostics off for speed). The
+    # march is deterministic at fixed mdot, so the physical result is
+    # bit-identical to ``pl_best``; only the per-cell dew/metastable/LVF
+    # arrays are now populated for the returned, user-facing ChainResult.
+    try:
+        fwd_s, dev_s, devBC_s, h_stag_s = _forward_to_device(
+            m_best, diagnostics=True,
+        )
+        bwd_s, P_first_s, P_anchor_s, P_sonic_s = _backward_from_anchor(
+            m_best, h_stag_s, diagnostics=True,
+        )
+    except (
+        OverChokedError, ChokeReached, SegmentConvergenceError,
+        EOSOutOfRange, EOSTwoPhase, HEMConsistencyError,
+    ):
+        # Unexpected re-march failure — fall back to the (diagnostics-off)
+        # bracketing probe. Physics identical; only two-phase arrays absent.
+        fwd_s, dev_s, devBC_s, bwd_s, P_first_s, P_anchor_s, P_sonic_s = pl_best
     return _assemble(
         m_best, fwd_s, dev_s, bwd_s,
         P_first_s, P_anchor_s, P_sonic_s, device_choked=False,
@@ -1447,7 +1566,9 @@ def _mode1_brentq(
     last_choked_smallest_mdot: float | None = None
     last_choke_diag: dict | None = None
 
-    def _march(mdot_try: float) -> ChainResult:
+    def _march(mdot_try: float, diagnostics: bool = True) -> ChainResult:
+        # diagnostics defaults True (safe: a returned/final march keeps full
+        # two-phase diagnostics). Throwaway probes pass diagnostics=False.
         return _chain_forward_march(
             chain, working_fluid, base_fluid,
             P_in, T_in, mdot_try,
@@ -1455,6 +1576,7 @@ def _mode1_brentq(
             solver_options=solver_options,
             t0=t0,
             cancel_event=cancel_event,
+            two_phase_diagnostics=diagnostics,
             **ivp_kwargs,
         )
 
@@ -1479,7 +1601,8 @@ def _mode1_brentq(
     def _obj(mdot_try: float) -> float:
         nonlocal last_good, last_good_mdot
         try:
-            r = _march(mdot_try)
+            # Throwaway bracketing probe — skip per-cell two-phase diagnostics.
+            r = _march(mdot_try, diagnostics=False)
             if r.choked:
                 return _mark_choked(mdot_try, r.choke_diagnostics)
             last_good = r
@@ -1664,7 +1787,7 @@ def _mode1_brentq(
             # is robust to this 0.1% offset.
             mdot_at_ceiling = mdot_ceiling * (1.0 - 1e-3)
             try:
-                r_ceiling = _march(mdot_at_ceiling)
+                r_ceiling = _march(mdot_at_ceiling, diagnostics=False)
             except (
                 OverChokedError, ChokeReached, SegmentConvergenceError,
                 EOSOutOfRange, EOSTwoPhase, HEMConsistencyError,
