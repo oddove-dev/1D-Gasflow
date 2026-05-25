@@ -949,6 +949,7 @@ class TabulatedFluid:
         self._n_outside_grid = 0
         self._n_failed = 0
         self._build_table()
+        self._build_dew_curve()
 
     def _build_table(self) -> None:
         """Populate the P×T property grids by direct EOS evaluation."""
@@ -987,6 +988,33 @@ class TabulatedFluid:
                 except Exception:
                     self._n_failed += 1
                     # Arrays already hold NaN; nothing to do.
+
+    def _build_dew_curve(self, n_dew: int = 120) -> None:
+        """Precompute a 1-D dew-temperature curve ``dew_T(P)`` once.
+
+        ``dew_temperature`` is the one quantity NOT bilinearly tabulated —
+        for a mixture each call is a full HEOS PQ-flash + QT round-trip
+        (~7 ms). ``_build_result`` evaluates it per cell of every march, so
+        a sweep that runs thousands of throwaway bracketing marches spends
+        the majority of its time here (profiled: 55% of a Skarv subcritical
+        solve). Since ``dew_T(P)`` is composition-fixed and smooth in P,
+        precompute it on a 1-D grid spanning the table's ``P_range`` and
+        linear-interpolate at lookup time (build-time ~1 s vs run-time
+        ~14000 × 7 ms). Result-neutral: dew_T only feeds the two-phase
+        metastable flag.
+
+        Grid points where the base returns ``None`` (P above the mixture
+        cricondenbar / no physical dew root) are stored as NaN; a query that
+        brackets a NaN returns ``None`` rather than interpolating across the
+        gap.
+        """
+        self._dew_P = np.linspace(self.P_range[0], self.P_range[1], n_dew)
+        self._dew_T = np.full(n_dew, np.nan, dtype=float)
+        self._dew_step = (self.P_range[1] - self.P_range[0]) / (n_dew - 1)
+        for i, P in enumerate(self._dew_P):
+            td = self._base.dew_temperature(float(P))
+            if td is not None:
+                self._dew_T[i] = td
 
     def props(self, P: float, T: float) -> FluidState:
         """Bilinear-interpolated lookup; falls back to direct EOS outside grid."""
@@ -1081,8 +1109,25 @@ class TabulatedFluid:
         return state
 
     def dew_temperature(self, P: float) -> float | None:
-        """Delegate to base — dew T not tabulated; called O(n_stations) per solve."""
-        return self._base.dew_temperature(P)
+        """Linear-interpolate the precomputed 1-D dew-T(P) curve.
+
+        Off the hot path (P outside the table's ``P_range``) falls back to a
+        direct base flash. A query bracketing a NaN curve point (no physical
+        dew root there) returns ``None``. See :meth:`_build_dew_curve`.
+        """
+        P_lo, P_hi = self.P_range
+        if not (P_lo <= P <= P_hi):
+            return self._base.dew_temperature(P)
+        n = self._dew_P.shape[0]
+        i = int((P - P_lo) / self._dew_step)
+        if i >= n - 1:
+            i = n - 2
+        T_l = self._dew_T[i]
+        T_r = self._dew_T[i + 1]
+        if not (np.isfinite(T_l) and np.isfinite(T_r)):
+            return None  # within / adjacent to a no-dew (cricondenbar) region
+        w = (P - self._dew_P[i]) / self._dew_step
+        return float(T_l * (1.0 - w) + T_r * w)
 
     def compute_lvf(self, P: float, h: float) -> float:
         """Delegate to base — LVF only needed at metastable stations."""
