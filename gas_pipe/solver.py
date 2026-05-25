@@ -94,8 +94,18 @@ def _build_result(
     n_adaptive: int,
     section_transitions: list[dict],
     march_direction: str = "forward",
+    two_phase_diagnostics: bool = True,
 ) -> "PipeResult":
-    """Assemble PipeResult from accumulated per-segment data."""
+    """Assemble PipeResult from accumulated per-segment data.
+
+    ``two_phase_diagnostics`` — when False, skip the per-cell dew-point /
+    metastable / LVF computation (set them all to NaN / empty). For a
+    mixture the per-cell dew flash dominates wall time, and the BVP solvers
+    run thousands of THROWAWAY bracketing marches whose two-phase flag is
+    never inspected; they pass False. The final accepted march (whose
+    PipeResult is returned to the user) keeps the default True, so the
+    user-facing two-phase diagnostics are unchanged.
+    """
     from .results import PipeResult
 
     n = len(x_list)
@@ -177,34 +187,39 @@ def _build_result(
     opts_full["n_adaptive_refinements"] = n_adaptive
 
     # Two-phase diagnostics: at each station compute the dew-point
-    # temperature; flag stations where T < T_dew as metastable. The
-    # GERGFluid.dew_temperature is cached per-pressure so repeat calls
-    # at the same P (common when Newton revisits a state) are free.
+    # temperature; flag stations where T < T_dew as metastable. With
+    # ``TabulatedFluid`` dew_temperature is a cheap 1-D interpolation; with
+    # the direct base it is a per-cell mixture flash. Skipped entirely on
+    # throwaway bracketing marches (``two_phase_diagnostics=False``), which
+    # never inspect the flag — only the final accepted march computes it.
     T_dew_arr = np.full(n, np.nan, dtype=float)
-    for i, P_i in enumerate(P_arr):
-        td = fluid.dew_temperature(float(P_i))
-        if td is not None:
-            T_dew_arr[i] = td
-    T_margin_arr = T_arr - T_dew_arr  # NaN propagates where T_dew unknown
-    # metastable_mask: True only where we have a finite T_dew AND T < T_dew.
-    # NaN comparisons are False, which is the desired behaviour here.
-    with np.errstate(invalid="ignore"):
-        metastable_mask = np.asarray(T_arr < T_dew_arr, dtype=bool)
-    had_metastable = bool(np.any(metastable_mask))
+    T_margin_arr = np.full(n, np.nan, dtype=float)
+    metastable_mask = np.zeros(n, dtype=bool)
+    had_metastable = False
     x_dewpoint_crossing: float | None = None
-    if had_metastable:
-        first = int(np.argmax(metastable_mask))
-        x_dewpoint_crossing = float(x_arr[first])
-    # LVF (liquid volume fraction) — populated only at metastable stations
-    # via isenthalpic flash. Non-metastable stations stay NaN, which the
-    # summary and plot treat as "not applicable, gas single-phase".
     LVF_arr = np.full(n, np.nan, dtype=float)
-    if had_metastable:
-        meta_indices = np.flatnonzero(metastable_mask)
-        for i in meta_indices:
-            LVF_arr[int(i)] = fluid.compute_lvf(
-                float(P_arr[int(i)]), float(h_arr[int(i)])
-            )
+    if two_phase_diagnostics:
+        for i, P_i in enumerate(P_arr):
+            td = fluid.dew_temperature(float(P_i))
+            if td is not None:
+                T_dew_arr[i] = td
+        T_margin_arr = T_arr - T_dew_arr  # NaN propagates where T_dew unknown
+        # metastable_mask: True only where T_dew is finite AND T < T_dew.
+        # NaN comparisons are False, which is the desired behaviour here.
+        with np.errstate(invalid="ignore"):
+            metastable_mask = np.asarray(T_arr < T_dew_arr, dtype=bool)
+        had_metastable = bool(np.any(metastable_mask))
+        if had_metastable:
+            first = int(np.argmax(metastable_mask))
+            x_dewpoint_crossing = float(x_arr[first])
+        # LVF (liquid volume fraction) — populated only at metastable
+        # stations via isenthalpic flash. Non-metastable stations stay NaN.
+        if had_metastable:
+            meta_indices = np.flatnonzero(metastable_mask)
+            for i in meta_indices:
+                LVF_arr[int(i)] = fluid.compute_lvf(
+                    float(P_arr[int(i)]), float(h_arr[int(i)])
+                )
 
     return PipeResult(
         x=x_arr,
@@ -324,6 +339,7 @@ def march_ivp(
     friction_model: str = "blended",
     progress_callback: Callable[[int, int], None] | None = None,
     cancel_event: "object | None" = None,
+    two_phase_diagnostics: bool = True,
 ) -> "PipeResult":
     """March inlet → outlet with prescribed mass flow rate.
 
@@ -577,6 +593,7 @@ def march_ivp(
         fluid=fluid, pipe=pipe, bc=bc, opts=opts,
         elapsed=elapsed, n_adaptive=n_adaptive,
         section_transitions=section_transitions,
+        two_phase_diagnostics=two_phase_diagnostics,
     )
 
 
@@ -802,6 +819,7 @@ def march_ivp_backward(
     n_segments: int = 100,
     friction_model: str = "blended",
     cancel_event: "object | None" = None,
+    two_phase_diagnostics: bool = True,
 ) -> "PipeResult":
     """Backward-march from outlet to inlet at fixed ``mdot`` and h_stag.
 
@@ -1001,6 +1019,7 @@ def march_ivp_backward(
         elapsed=elapsed, n_adaptive=0,
         section_transitions=[],
         march_direction="backward",
+        two_phase_diagnostics=two_phase_diagnostics,
     )
 
 
