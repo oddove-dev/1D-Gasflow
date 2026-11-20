@@ -154,6 +154,29 @@ Sequence (remaining; Item numbers assigned at implementation start):
   ~2 of 200 Skarv segments need the retry; not a problem at present. If
   retry rate climbs past ~5%, switch to hybrid chord/fresh-Jacobian scheme.
 
+- **D\* label: report "at choke threshold" near the boundary (cosmetic)**.
+  At the choked↔subcritical boundary D\* the two regimes are the same
+  physical state (mdot_device = mdot_pipe, P_first = P_crit). Two
+  near-identical solves whose per-P_out table windows give P_crit differing
+  by ~0.02 bar can land on opposite sides of the binary label (the 20.4 mm
+  case flips choked vs subcritical between P_out = 2 and 1.013). Physically
+  meaningless — mdot/P_first/P_last agree to ~0.1%. Cosmetic fix: when
+  ``P_first`` is within ~1% of ``P_crit``, report "at choke threshold (D\*)"
+  instead of forcing the binary choked/subcritical label. Do NOT add a
+  tolerance band to the *solve* (that just relocates the flip); this is a
+  display-only refinement.
+
+- **Lag 2 jet model: two-phase free-jet expansion**. The pipe solution is
+  single-phase throughout (verified: ``compute_lvf`` fires 0 times across the
+  Skarv deep-tail sweep; the exit-sonic state sits ~40 K above dew). But the
+  free under-expanded jet OUTSIDE the pipe, expanding from ``P_exit_sonic``
+  down to a low reservoir ``P_out``, genuinely CAN flash two-phase — the gas
+  cools sharply as it expands (the hypothetical "gas expanded all the way to
+  P_out" state is ~100 K below dew at P_out = 1.013 bara). The Lag-2 jet
+  model must account for two-phase expansion to a low ``P_out``; this is the
+  jet model's concern, not the pipe solver's. (Surfaced while diagnosing the
+  deep-tail short-circuit probe in the exit-sonic anchor.)
+
 ## Done
 
 - **2026-05-16**: Backward march for pipes downstream of device choke —

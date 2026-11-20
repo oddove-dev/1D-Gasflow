@@ -184,6 +184,18 @@ _CHOKE_KIND_LABELS: dict[str, str] = {
     "device_choke_downstream_backward": (
         "Device choke (downstream backward march)"
     ),
+    "device_choked_pipe_exit_sonic": (
+        "Device choked; downstream pipe sonic at exit (free jet to P_out)"
+    ),
+    "device_choked_pipe_P_out": (
+        "Device choked; downstream pipe subsonic, discharges at P_out"
+    ),
+    "device_subcritical_pipe_exit_sonic": (
+        "Device subcritical; downstream pipe sonic at exit (free jet to P_out)"
+    ),
+    "device_subcritical_pipe_P_out": (
+        "Device subcritical; downstream pipe subsonic, discharges at P_out"
+    ),
     "device_over_choked": "Device over-choked (BC unreachable)",
     "fanno_pipe": "Pipe Fanno choke",
     "fanno_pipe_during_march": "Pipe Fanno choke during march",
@@ -230,6 +242,41 @@ def _format_choke_diagnostics(diag: dict) -> str:
     if "P_throat" in diag:
         known.add("P_throat")
         _emit("Throat P:", f"{float(diag['P_throat']) / 1e5:.3f} bara")
+
+    # Item 10 bottleneck diagnostics (consistency rule + exit-sonic anchor).
+    if "device_state" in diag:
+        known.add("device_state")
+        _emit("Device:", str(diag["device_state"]))
+    if "outlet_anchor" in diag:
+        known.add("outlet_anchor")
+        anchor = diag["outlet_anchor"]
+        label = "exit-sonic (free jet to P_out)" if anchor == "exit_sonic" \
+            else "P_out (subsonic exit)"
+        _emit("Outlet anchor:", label)
+    if diag.get("M_vc") is not None:
+        known.add("M_vc")
+        _emit("M_vc:", f"{float(diag['M_vc']):.4f}")
+    if diag.get("f_rec") is not None:
+        known.add("f_rec")
+        _emit("f_rec:", f"{float(diag['f_rec']):.4f}  (recovery taper)")
+    if diag.get("P_first") is not None:
+        known.add("P_first")
+        _emit("Pipe P_first:", f"{float(diag['P_first']) / 1e5:.3f} bara")
+    if diag.get("P_crit") is not None:
+        known.add("P_crit")
+        _emit("Device P_crit:", f"{float(diag['P_crit']) / 1e5:.3f} bara")
+    if diag.get("P_exit_sonic") is not None:
+        known.add("P_exit_sonic")
+        _emit("P_exit_sonic:", f"{float(diag['P_exit_sonic']) / 1e5:.3f} bara")
+    if diag.get("devBC") is not None:
+        known.add("devBC")
+        _emit("Borda-Carnot P:", f"{float(diag['devBC']) / 1e5:.3f} bara")
+    # mdot / mdot_device / P_anchor / P_last_cell / P_out / device_choked
+    # are shown in the header totals; suppress the raw-key fallback.
+    known.update({
+        "mdot", "mdot_device", "P_anchor", "P_last_cell", "P_out",
+        "device_choked",
+    })
 
     if "T_throat" in diag:
         known.add("T_throat")
@@ -2812,6 +2859,25 @@ class MainWindow:
             f"  Choked       = {result.choked}",
             f"  Elapsed      = {result.elapsed:.2f} s",
         ]
+        # Per-pipe computed first/last cell pressures, surfaced in the
+        # header alongside ṁ and the chain-level P_out (Item 10). P_first
+        # and P_end are always COMPUTED results — never BCs (the sole
+        # downstream BC is P_out). A backward-marched downstream pipe has
+        # its P_end set by the exit-sonic anchor or P_out, and its P_first
+        # computed inward; a forward-marched pipe is the reverse.
+        pipe_idx = 0
+        pipe_lines: list[str] = ["", "  Per-pipe (computed P_first → P_end):"]
+        for el_result in result.results:
+            if isinstance(el_result, PipeResult):
+                pipe_idx += 1
+                pipe_lines.append(
+                    f"    Pipe {pipe_idx}: "
+                    f"P_first = {el_result.P[0] / 1e5:.3f} bara → "
+                    f"P_end = {el_result.P[-1] / 1e5:.3f} bara   "
+                    f"(M {el_result.M[0]:.3f} → {el_result.M[-1]:.3f}, "
+                    f"{el_result.march_direction})"
+                )
+        header_lines += pipe_lines
         if result.choke_diagnostics:
             header_lines.append("")
             header_lines.append(_format_choke_diagnostics(
